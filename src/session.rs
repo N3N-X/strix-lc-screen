@@ -14,19 +14,25 @@ const USAGE: u16 = 0x0001;
 pub struct Panel {
     device: HidDevice,
     seq: u32,
+    /// Reused 1025-byte picture report. Filling this beats allocating one per slice.
+    report: Vec<u8>,
 }
 
 impl Panel {
     pub fn open() -> Result<Self> {
         let api = HidApi::new().context("HID library failed to start")?;
         let info = find_screen(&api)?;
-        let device = info
-            .open_device(&api)
-            .context("could not open the pump screen. Quit \"ROG STRIX LC & SLC IV Series\" and try again")?;
+        let device = info.open_device(&api).context(
+            "could not open the pump screen. Quit \"ROG STRIX LC & SLC IV Series\" and try again",
+        )?;
         device
             .set_blocking_mode(false)
             .context("could not set the screen read mode")?;
-        Ok(Self { device, seq: 0 })
+        Ok(Self {
+            device,
+            seq: 0,
+            report: vec![0u8; 1025],
+        })
     }
 
     pub fn connect(&mut self) -> Result<serde_json::Value> {
@@ -101,19 +107,22 @@ impl Panel {
             }
             let end = (offset + CHUNK).min(jpeg.len());
             let chunk = &jpeg[offset..end];
-            let mut report = vec![0u8; 1025];
+            if self.report.len() != 1025 {
+                self.report.resize(1025, 0);
+            }
+            self.report.fill(0);
             let value_len = (21 + chunk.len()) as u16;
-            report[0] = 0x00;
-            report[1] = 0x5c;
-            report[2..4].copy_from_slice(&value_len.to_be_bytes());
-            report[4] = id;
-            report[5..7].copy_from_slice(&blocks.to_be_bytes());
-            report[7..9].copy_from_slice(&index.to_be_bytes());
-            report[9] = 0x01;
-            report[25..25 + chunk.len()].copy_from_slice(chunk);
+            self.report[0] = 0x00;
+            self.report[1] = 0x5c;
+            self.report[2..4].copy_from_slice(&value_len.to_be_bytes());
+            self.report[4] = id;
+            self.report[5..7].copy_from_slice(&blocks.to_be_bytes());
+            self.report[7..9].copy_from_slice(&index.to_be_bytes());
+            self.report[9] = 0x01;
+            self.report[25..25 + chunk.len()].copy_from_slice(chunk);
             let wrote = self
                 .device
-                .write(&report)
+                .write(&self.report)
                 .context("could not write the picture to the pump")?;
             if wrote == 0 {
                 bail!("the pump did not accept the picture");

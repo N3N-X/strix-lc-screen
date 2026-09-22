@@ -57,7 +57,9 @@ fn main() -> Result<()> {
         return Ok(());
     };
     let mut panel = Panel::open()?;
-    let identity = panel.connect().context("the screen did not accept the handshake")?;
+    let identity = panel
+        .connect()
+        .context("the screen did not accept the handshake")?;
     match command {
         Command::Status => {
             let state = panel.state()?;
@@ -134,12 +136,18 @@ fn ensure_official_app_is_closed() -> Result<()> {
 
 fn print_state(identity: &serde_json::Value, state: &serde_json::Value) {
     let version = &identity["version"];
-    println!("serial:     {}", identity["sn"].as_str().unwrap_or("unknown"));
+    println!(
+        "serial:     {}",
+        identity["sn"].as_str().unwrap_or("unknown")
+    );
     println!(
         "firmware:   {}",
         version["firmware"].as_str().unwrap_or("unknown")
     );
-    println!("hardware:   {}", version["hardware"].as_str().unwrap_or("unknown"));
+    println!(
+        "hardware:   {}",
+        version["hardware"].as_str().unwrap_or("unknown")
+    );
     println!("brightness: {}", state["brightness"]);
     println!("rotation:   {}", state["degree"]);
     println!("free space: {}", state["space"]);

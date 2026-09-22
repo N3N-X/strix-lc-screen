@@ -84,10 +84,8 @@ pub struct Clip {
 pub fn photo_jpeg(path: &Path, crop: &Crop) -> Result<Vec<u8>> {
     let ffmpeg = require_ffmpeg()?;
     let probe = probe_media(&ffmpeg, path)?;
-    let out = std::env::temp_dir().join(format!(
-        "strix-lc-screen-still-{}.jpg",
-        std::process::id()
-    ));
+    let out =
+        std::env::temp_dir().join(format!("strix-lc-screen-still-{}.jpg", std::process::id()));
     run_ffmpeg(
         &ffmpeg,
         &[
@@ -199,7 +197,8 @@ pub fn video_jpegs(path: &Path, crop: &Crop) -> Result<Clip> {
                 break;
             }
             frames.push(
-                std::fs::read(&file).with_context(|| format!("could not read {}", file.display()))?,
+                std::fs::read(&file)
+                    .with_context(|| format!("could not read {}", file.display()))?,
             );
             index += 1;
             if frames.len() >= 160 {

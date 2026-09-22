@@ -31,6 +31,7 @@ struct Snapshot {
     free_space: String,
 }
 
+#[derive(Clone)]
 struct Worker {
     pub(crate) tx: Sender<Request>,
     cancel: Arc<AtomicBool>,
@@ -73,6 +74,9 @@ struct Playing {
     frame_ms: u64,
     index: usize,
     next_at: Instant,
+    /// A frame has reached the pump. Later failures give up sooner than the login retry.
+    delivered: bool,
+    retries: u8,
 }
 
 fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<AtomicU32>) {
@@ -109,6 +113,8 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
                         frame_ms: frame_ms.max(1),
                         index: 0,
                         next_at: Instant::now(),
+                        delivered: false,
+                        retries: 0,
                     });
                     cancel.store(false, Ordering::Relaxed);
                 }
@@ -131,16 +137,18 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
             playing = None;
             continue;
         }
-        let Some(play) = playing.as_mut() else {
-            continue;
-        };
-        if play.frames.is_empty() {
+        if playing.as_ref().is_some_and(|play| play.frames.is_empty()) {
             playing = None;
             continue;
         }
-        if Instant::now() < play.next_at {
+        let ready = match playing.as_ref() {
+            Some(play) if Instant::now() < play.next_at => continue,
+            Some(play) => Some((play.index == 0, play.index)),
+            None => None,
+        };
+        let Some((prepare, index)) = ready else {
             continue;
-        }
+        };
         if panel.is_none() {
             panel = Panel::open()
                 .and_then(|mut panel| {
@@ -149,31 +157,72 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
                 })
                 .ok();
         }
-        let Some(panel) = panel.as_mut() else {
-            play.next_at = Instant::now() + Duration::from_millis(500);
+        if panel.is_none() {
+            if let Some(play) = playing.as_mut() {
+                play.next_at = Instant::now() + Duration::from_millis(500);
+            }
             continue;
-        };
-        let prepare = play.index == 0;
-        let jpeg = &play.frames[play.index];
-        let began = Instant::now();
-        let result = if prepare {
-            panel.show_jpeg(jpeg, &|| cancel.load(Ordering::Relaxed))
-        } else {
-            panel.push_jpeg(jpeg, &|| cancel.load(Ordering::Relaxed))
-        };
-        if result.is_err() {
+        }
+        if playing
+            .as_ref()
+            .is_some_and(|play| play.frames.get(index).is_none())
+        {
             playing = None;
             continue;
         }
-        let thousandths = speed.load(Ordering::Relaxed).clamp(250, 2000) as f32 / 1000.0;
-        let gap = Duration::from_millis(play.frame_ms).div_f32(thousandths);
-        let spent = began.elapsed();
-        play.next_at = if gap > spent {
-            Instant::now() + (gap - spent)
-        } else {
-            Instant::now()
+        let began = Instant::now();
+        let result = {
+            let panel = panel.as_mut().expect("panel is open");
+            let jpeg = &playing.as_ref().expect("clip is loaded").frames[index];
+            if prepare {
+                panel.show_jpeg(jpeg, &|| cancel.load(Ordering::Relaxed))
+            } else {
+                panel.push_jpeg(jpeg, &|| cancel.load(Ordering::Relaxed))
+            }
         };
-        play.index = (play.index + 1) % play.frames.len();
+        if result.is_err() {
+            // At sign-in the pump USB is often still enumerating. Keep the clip
+            // and try again. Once frames are flowing, a few failures mean it left.
+            let give_up = match playing.as_mut() {
+                Some(play) => {
+                    let limit = if play.delivered { 3 } else { 40 };
+                    play.retries = play.retries.saturating_add(1);
+                    if play.retries > limit {
+                        true
+                    } else {
+                        play.next_at = Instant::now() + Duration::from_millis(500);
+                        false
+                    }
+                }
+                None => true,
+            };
+            if give_up {
+                playing = None;
+            }
+            continue;
+        }
+        if let Some(play) = playing.as_mut() {
+            play.delivered = true;
+            play.retries = 0;
+            let thousandths = speed.load(Ordering::Relaxed).clamp(250, 2000) as f32 / 1000.0;
+            let gap = Duration::from_millis(play.frame_ms).div_f32(thousandths);
+            let spent = began.elapsed();
+            // If a frame already used up its slot, wait out another full slot.
+            // Sending the next one immediately pegs a core trying to catch up.
+            play.next_at = Instant::now() + next_frame_delay(gap, spent);
+            let count = play.frames.len();
+            play.index = (play.index + 1) % count.max(1);
+        }
+    }
+}
+
+/// Sleep until the next frame. A send that already ran long still waits a full
+/// slot, so playback cannot busy-loop to catch up.
+fn next_frame_delay(gap: Duration, spent: Duration) -> Duration {
+    if gap > spent {
+        gap - spent
+    } else {
+        gap
     }
 }
 
@@ -328,6 +377,8 @@ struct App {
     tray: TrayMenu,
     quit: bool,
     hide_once: bool,
+    /// Window is parked off-screen. It stays visible to Windows so paints still arrive.
+    in_tray: bool,
     resume_when_ready: bool,
     tray_rx: std::sync::mpsc::Receiver<TrayAction>,
 }
@@ -345,7 +396,9 @@ struct TrayMenu {
 enum JobResult {
     Snapshot(Result<Snapshot>),
     Done(Result<()>),
-    Frames(Result<media::Clip>),
+    /// The worker is already playing. The UI only needs the count for its status line.
+    Playing(usize),
+    Failed(String),
 }
 
 impl App {
@@ -397,6 +450,7 @@ impl App {
             tray: TrayMenu::build(),
             quit: false,
             hide_once: start_in_tray,
+            in_tray: false,
             resume_when_ready,
             tray_rx,
         }
@@ -413,7 +467,8 @@ impl App {
         }
     }
 
-    fn show_window(&self, ctx: &egui::Context) {
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.in_tray = false;
         reveal_pump_window();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -495,22 +550,16 @@ impl App {
             JobResult::Done(Err(error)) => {
                 self.status = format!("{error:#}");
             }
-            JobResult::Frames(Ok(clip)) => {
-                let count = clip.frames.len();
-                let frame_ms = clip.frame_ms;
-                if let Err(error) = self.worker.play(clip.frames, frame_ms) {
-                    self.status = format!("{error:#}");
+            JobResult::Playing(count) => {
+                let stay = if self.settings.close_to_tray {
+                    "Closing the window leaves it running in the tray."
                 } else {
-                    let stay = if self.settings.close_to_tray {
-                        "Closing the window leaves it running in the tray."
-                    } else {
-                        "The window has to stay open."
-                    };
-                    self.status = format!("Playing {count} frames at {:.2}×. {stay}", self.speed);
-                }
+                    "The window has to stay open."
+                };
+                self.status = format!("Playing {count} frames at {:.2}×. {stay}", self.speed);
             }
-            JobResult::Frames(Err(error)) => {
-                self.status = format!("{error:#}");
+            JobResult::Failed(error) => {
+                self.status = error;
             }
         }
         ctx.request_repaint();
@@ -532,11 +581,8 @@ impl App {
                         [decoded.width() as usize, decoded.height() as usize],
                         decoded.as_raw(),
                     );
-                    self.preview = Some(ctx.load_texture(
-                        "preview",
-                        color,
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    self.preview =
+                        Some(ctx.load_texture("preview", color, egui::TextureOptions::LINEAR));
                     self.source_width = preview.width;
                     self.source_height = preview.height;
                     self.status = "Drag the square to crop, then show it on the pump.".into();
@@ -556,22 +602,39 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_tray(ctx);
-        if self.hide_once {
+        if self.hide_once && park_pump_window() {
             self.hide_once = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.in_tray = true;
+        } else if self.hide_once {
+            ctx.request_repaint();
         }
-        if ctx.input(|input| input.viewport().close_requested()) && !self.quit && self.settings.close_to_tray {
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.quit
+            && self.settings.close_to_tray
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            if park_pump_window() {
+                self.in_tray = true;
+            }
+        }
+        if self.in_tray {
+            // A second launch, or a tray click, puts the window back on a monitor.
+            if pump_window_is_on_screen() {
+                self.in_tray = false;
+            } else {
+                // The first frame's show rewrites window styles and would put a taskbar button back.
+                let _ = park_pump_window();
+            }
         }
         self.poll(ctx);
         self.poll_preview(ctx);
         self.refresh_asus_flag();
-        ctx.request_repaint_after(Duration::from_millis(if self.pending.is_some() || self.preview_rx.is_some() {
-            200
-        } else {
-            500
-        }));
+        let waiting = self.pending.is_some() || self.preview_rx.is_some();
+        if waiting {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        } else if !self.in_tray {
+            ctx.request_repaint_after(Duration::from_secs(3));
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Pump screen");
@@ -762,10 +825,8 @@ fn crop_view(
     } else {
         (max_w * aspect, max_w)
     };
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(disp_w, disp_h),
-        egui::Sense::click_and_drag(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(disp_w, disp_h), egui::Sense::click_and_drag());
     ui.painter().image(
         texture.id(),
         rect,
@@ -797,12 +858,18 @@ fn crop_view(
         shade,
     );
     painter.rect_filled(
-        egui::Rect::from_min_max(egui::pos2(rect.min.x, crop_rect.min.y), crop_rect.left_bottom()),
+        egui::Rect::from_min_max(
+            egui::pos2(rect.min.x, crop_rect.min.y),
+            crop_rect.left_bottom(),
+        ),
         0.0,
         shade,
     );
     painter.rect_filled(
-        egui::Rect::from_min_max(crop_rect.right_top(), egui::pos2(rect.max.x, crop_rect.max.y)),
+        egui::Rect::from_min_max(
+            crop_rect.right_top(),
+            egui::pos2(rect.max.x, crop_rect.max.y),
+        ),
         0.0,
         shade,
     );
@@ -915,7 +982,9 @@ impl App {
         let Some(path) = rfd::FileDialog::new()
             .add_filter(
                 "Photos and video",
-                &["png", "jpg", "jpeg", "gif", "bmp", "mp4", "mov", "avi", "mkv", "webm"],
+                &[
+                    "png", "jpg", "jpeg", "gif", "bmp", "mp4", "mov", "avi", "mkv", "webm",
+                ],
             )
             .pick_file()
         else {
@@ -949,7 +1018,6 @@ impl App {
         self.worker.stop_playback();
         self.busy = true;
         let (tx, rx) = mpsc::channel();
-        let worker_tx = self.worker.tx.clone();
         let crop = Crop {
             zoom: self.zoom,
             pan_x: self.pan_x,
@@ -958,16 +1026,26 @@ impl App {
         self.worker.set_speed(self.speed);
         if media::is_video(&path) {
             self.status = "Preparing the video…".into();
+            let player = self.worker.clone();
             thread::spawn(move || match video_jpegs(&path, &crop) {
                 Ok(clip) => {
-                    let _ = tx.send(JobResult::Frames(Ok(clip)));
+                    let count = clip.frames.len();
+                    let frame_ms = clip.frame_ms;
+                    // Play from this thread. The window may be parked off-screen, and a
+                    // parked window must not have to paint before the pump gets frames.
+                    if let Err(error) = player.play(clip.frames, frame_ms) {
+                        let _ = tx.send(JobResult::Failed(format!("{error:#}")));
+                        return;
+                    }
+                    let _ = tx.send(JobResult::Playing(count));
                 }
                 Err(error) => {
-                    let _ = tx.send(JobResult::Frames(Err(error)));
+                    let _ = tx.send(JobResult::Failed(format!("{error:#}")));
                 }
             });
         } else {
             self.status = "Sending the photo…".into();
+            let worker_tx = self.worker.tx.clone();
             thread::spawn(move || {
                 let jpeg = match photo_jpeg(&path, &crop) {
                     Ok(jpeg) => jpeg,
@@ -1124,28 +1202,16 @@ impl TrayMenu {
     }
 }
 
-fn reveal_pump_window() {
+/// Puts the window back on the primary monitor and on the taskbar.
+pub fn reveal_pump_window() {
     #[cfg(windows)]
     unsafe {
-        use std::ffi::c_void;
-        unsafe extern "system" {
-            fn FindWindowW(class: *const u16, window: *const u16) -> *mut c_void;
-            fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
-            fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
-            fn BringWindowToTop(hwnd: *mut c_void) -> i32;
-            fn IsIconic(hwnd: *mut c_void) -> i32;
-            fn GetForegroundWindow() -> *mut c_void;
-            fn GetWindowThreadProcessId(hwnd: *mut c_void, process: *mut u32) -> u32;
-            fn GetCurrentThreadId() -> u32;
-            fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
-        }
-        let title: Vec<u16> = "Pump screen"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
-        if hwnd.is_null() {
+        let Some(hwnd) = pump_hwnd() else {
             return;
+        };
+        set_taskbar_button(hwnd, true);
+        if !pump_window_is_on_screen() {
+            place_on_primary(hwnd);
         }
         let cmd = if IsIconic(hwnd) != 0 { 9 } else { 5 };
         ShowWindow(hwnd, cmd);
@@ -1161,6 +1227,200 @@ fn reveal_pump_window() {
             SetForegroundWindow(hwnd);
             BringWindowToTop(hwnd);
         }
+    }
+}
+
+/// Moves the window off the virtual screen without hiding it.
+///
+/// `ShowWindow(SW_HIDE)` makes Windows drop `WM_PAINT`. eframe then leaves its
+/// event loop in `Poll` after a missed redraw, which burns one core and never
+/// reaches the code that starts playback.
+fn park_pump_window() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        let Some(hwnd) = pump_hwnd() else {
+            return false;
+        };
+        if !pump_window_is_on_screen() && is_tool_window(hwnd) {
+            return true;
+        }
+        set_taskbar_button(hwnd, false);
+        let rect = window_rect(hwnd);
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
+        let x = GetSystemMetrics(76)
+            .saturating_sub(width)
+            .saturating_sub(80);
+        let y = GetSystemMetrics(77)
+            .saturating_sub(height)
+            .saturating_sub(80);
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            0x0010 | 0x0001 | 0x0004 | 0x0020,
+        );
+        // Refresh the taskbar button, then leave the window visible so paints still arrive.
+        ShowWindow(hwnd, 0);
+        ShowWindow(hwnd, 8);
+        return true;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn pump_window_is_on_screen() -> bool {
+    #[cfg(windows)]
+    unsafe {
+        let Some(hwnd) = pump_hwnd() else {
+            return false;
+        };
+        let rect = window_rect(hwnd);
+        let cx = rect.left.saturating_add(rect.right) / 2;
+        let cy = rect.top.saturating_add(rect.bottom) / 2;
+        let vx = GetSystemMetrics(76);
+        let vy = GetSystemMetrics(77);
+        let vw = GetSystemMetrics(78);
+        let vh = GetSystemMetrics(79);
+        return cx >= vx && cy >= vy && cx < vx.saturating_add(vw) && cy < vy.saturating_add(vh);
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn pump_hwnd() -> Option<*mut std::ffi::c_void> {
+    let title: Vec<u16> = "Pump screen"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(hwnd)
+    }
+}
+
+#[cfg(windows)]
+fn window_rect(hwnd: *mut std::ffi::c_void) -> Rect {
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe {
+        GetWindowRect(hwnd, &mut rect);
+    }
+    rect
+}
+
+#[cfg(windows)]
+fn place_on_primary(hwnd: *mut std::ffi::c_void) {
+    unsafe {
+        let rect = window_rect(hwnd);
+        let width = (rect.right - rect.left).max(200);
+        let height = (rect.bottom - rect.top).max(200);
+        let screen_w = GetSystemMetrics(0).max(width);
+        let screen_h = GetSystemMetrics(1).max(height);
+        let x = (screen_w - width) / 2;
+        let y = (screen_h - height) / 2;
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            x,
+            y,
+            0,
+            0,
+            0x0010 | 0x0001 | 0x0004 | 0x0020,
+        );
+    }
+}
+
+#[cfg(windows)]
+fn is_tool_window(hwnd: *mut std::ffi::c_void) -> bool {
+    unsafe {
+        const GWL_EXSTYLE: i32 = -20;
+        const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+        const WS_EX_APPWINDOW: isize = 0x0004_0000;
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        style & WS_EX_TOOLWINDOW != 0 && style & WS_EX_APPWINDOW == 0
+    }
+}
+
+fn set_taskbar_button(hwnd: *mut std::ffi::c_void, show: bool) {
+    unsafe {
+        const GWL_EXSTYLE: i32 = -20;
+        const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+        const WS_EX_APPWINDOW: isize = 0x0004_0000;
+        let mut style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if show {
+            style &= !WS_EX_TOOLWINDOW;
+            style |= WS_EX_APPWINDOW;
+        } else {
+            style |= WS_EX_TOOLWINDOW;
+            style &= !WS_EX_APPWINDOW;
+        }
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn FindWindowW(class: *const u16, window: *const u16) -> *mut std::ffi::c_void;
+    fn ShowWindow(hwnd: *mut std::ffi::c_void, cmd: i32) -> i32;
+    fn SetForegroundWindow(hwnd: *mut std::ffi::c_void) -> i32;
+    fn BringWindowToTop(hwnd: *mut std::ffi::c_void) -> i32;
+    fn IsIconic(hwnd: *mut std::ffi::c_void) -> i32;
+    fn GetForegroundWindow() -> *mut std::ffi::c_void;
+    fn GetWindowThreadProcessId(hwnd: *mut std::ffi::c_void, process: *mut u32) -> u32;
+    fn GetCurrentThreadId() -> u32;
+    fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
+    fn GetWindowRect(hwnd: *mut std::ffi::c_void, rect: *mut Rect) -> i32;
+    fn GetSystemMetrics(index: i32) -> i32;
+    fn SetWindowPos(
+        hwnd: *mut std::ffi::c_void,
+        insert_after: *mut std::ffi::c_void,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
+    fn GetWindowLongPtrW(hwnd: *mut std::ffi::c_void, index: i32) -> isize;
+    fn SetWindowLongPtrW(hwnd: *mut std::ffi::c_void, index: i32, value: isize) -> isize;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slow_frame_still_waits_a_full_slot() {
+        let gap = Duration::from_millis(125);
+        assert_eq!(
+            next_frame_delay(gap, Duration::from_millis(40)),
+            Duration::from_millis(85)
+        );
+        assert_eq!(next_frame_delay(gap, Duration::from_millis(125)), gap);
+        assert_eq!(next_frame_delay(gap, Duration::from_millis(400)), gap);
     }
 }
 

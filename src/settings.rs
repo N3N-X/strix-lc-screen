@@ -121,13 +121,8 @@ fn claim_single_instance_windows() -> bool {
         fn CreateMutexW(attrs: *mut c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
         fn GetLastError() -> u32;
         fn FindWindowW(class: *const u16, window: *const u16) -> *mut c_void;
-        fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
-        fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
-        fn IsIconic(hwnd: *mut c_void) -> i32;
     }
     const ERROR_ALREADY_EXISTS: u32 = 183;
-    const SW_SHOW: i32 = 5;
-    const SW_RESTORE: i32 = 9;
     let name: Vec<u16> = "Local\\strix-lc-screen"
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -144,9 +139,7 @@ fn claim_single_instance_windows() -> bool {
                 .collect();
             let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
             if !hwnd.is_null() {
-                let cmd = if IsIconic(hwnd) != 0 { SW_RESTORE } else { SW_SHOW };
-                ShowWindow(hwnd, cmd);
-                SetForegroundWindow(hwnd);
+                crate::gui::reveal_pump_window();
             }
             return false;
         }

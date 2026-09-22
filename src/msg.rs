@@ -83,9 +83,7 @@ pub fn parse_response(payload: &[u8]) -> Result<Response> {
     let head = std::str::from_utf8(&payload[..text_end])
         .map_err(|_| anyhow!("response header is not text"))?;
     let mut lines = head.split("\r\n");
-    let status = lines
-        .next()
-        .ok_or_else(|| anyhow!("response is empty"))?;
+    let status = lines.next().ok_or_else(|| anyhow!("response is empty"))?;
     let mut parts = status.split_whitespace();
     let version = parts
         .next()
@@ -138,7 +136,12 @@ mod tests {
 
     #[test]
     fn rebuilds_the_logged_power_request() {
-        let payload = request("power", 1, 1_790_009_966_892, Some(br#"{"event":"resume"}"#));
+        let payload = request(
+            "power",
+            1,
+            1_790_009_966_892,
+            Some(br#"{"event":"resume"}"#),
+        );
         assert_eq!(encode(&payload), hex("5a006c504f535420706f77657220310d0a5365714e756d6265723d310d0a446174653d313739303030393936363839320d0a436f6e74656e74547970653d6a736f6e0d0a436f6e74656e744c656e6774683d31380d0a0d0a7b226576656e74223a22726573756d65227d0b5a"));
     }
 
