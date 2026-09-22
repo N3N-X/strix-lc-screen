@@ -1,0 +1,22 @@
+[package]
+name = "strix-lc-screen"
+version = "0.1.0"
+edition = "2021"
+description = "Controller for the ROG Strix LC IV pump screen"
+license = "MIT"
+
+[[bin]]
+name = "strix-lc-screen"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+eframe = "0.31"
+hidapi = "2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tray-icon = "0.20"
+winreg = "0.55"
