@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Pump screen
+Comment=ROG Strix LC IV pump screen
+Exec=strix-lc-screen
+Terminal=false
+Categories=Settings;HardwareSettings;
