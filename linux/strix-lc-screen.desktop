@@ -3,5 +3,7 @@ Type=Application
 Name=Pump screen
 Comment=ROG Strix LC IV pump screen
 Exec=strix-lc-screen
+Icon=strix-lc-screen
+StartupWMClass=strix-lc-screen
 Terminal=false
 Categories=Settings;HardwareSettings;

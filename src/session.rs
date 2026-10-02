@@ -22,7 +22,18 @@ impl Panel {
     pub fn open() -> Result<Self> {
         let api = HidApi::new().context("HID library failed to start")?;
         let info = find_screen(&api)?;
-        let device = info.open_device(&api).context(open_screen_hint())?;
+        let device = match info.open_device(&api) {
+            Ok(device) => device,
+            Err(error) => {
+                let text = error.to_string();
+                if text.to_ascii_lowercase().contains("permission") {
+                    bail!(
+                        "Permission denied opening the pump. Unplug the cooler and plug it back in."
+                    );
+                }
+                return Err(error).context(open_screen_hint());
+            }
+        };
         device
             .set_blocking_mode(false)
             .context("could not set the screen read mode")?;

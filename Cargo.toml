@@ -1,6 +1,6 @@
 [package]
 name = "strix-lc-screen"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Controller for the ROG Strix LC IV pump screen"
 license = "MIT"
@@ -48,6 +48,7 @@ assets = [
     "$auto",
     ["linux/60-strix-lc-screen.rules", "usr/lib/udev/rules.d/60-strix-lc-screen.rules", "644"],
     ["linux/strix-lc-screen.desktop", "usr/share/applications/strix-lc-screen.desktop", "644"],
+    ["linux/strix-lc-screen.png", "usr/share/icons/hicolor/256x256/apps/strix-lc-screen.png", "644"],
     ["packaging/ffmpeg", "usr/lib/strix-lc-screen/ffmpeg", "755"],
     ["packaging/FFMPEG.txt", "usr/share/doc/strix-lc-screen/ffmpeg.txt", "644"],
 ]

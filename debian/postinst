@@ -1,6 +1,11 @@
 #!/bin/sh
 set -e
-if [ "$1" = "configure" ] && command -v udevadm >/dev/null 2>&1; then
-    udevadm control --reload-rules || true
-    udevadm trigger --subsystem-match=hidraw || true
+if [ "$1" = "configure" ]; then
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules || true
+        udevadm trigger --subsystem-match=hidraw || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1 || true
+    fi
 fi

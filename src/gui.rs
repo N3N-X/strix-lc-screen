@@ -298,6 +298,8 @@ pub fn run(start_in_tray: bool) -> eframe::Result<()> {
     if !settings::claim_single_instance() {
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    settings::install_launcher();
     let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel(64);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -305,7 +307,9 @@ pub fn run(start_in_tray: bool) -> eframe::Result<()> {
             .with_min_inner_size([420.0, 560.0])
             .with_resizable(true)
             .with_decorations(true)
-            .with_title("Pump screen"),
+            .with_title("Pump screen")
+            .with_app_id("strix-lc-screen")
+            .with_icon(crate::icon::window_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -348,6 +352,7 @@ fn tray_click_shows_window(event: &tray_icon::TrayIconEvent) -> bool {
 struct App {
     worker: Worker,
     snapshot: Option<Snapshot>,
+    connection_error: Option<String>,
     brightness: u8,
     status: String,
     busy: bool,
@@ -428,6 +433,7 @@ impl App {
         Self {
             worker,
             snapshot: None,
+            connection_error: None,
             brightness: 100,
             status: "Reading the pump…".into(),
             busy: true,
@@ -455,7 +461,7 @@ impl App {
         }
     }
 
-    fn persist(&mut self) {
+    fn persist(&mut self) -> bool {
         self.settings.zoom = self.zoom;
         self.settings.pan_x = self.pan_x;
         self.settings.pan_y = self.pan_y;
@@ -463,7 +469,9 @@ impl App {
         self.settings.last_path = self.chosen.as_ref().map(|path| path.display().to_string());
         if let Err(error) = self.settings.save() {
             self.status = format!("{error:#}");
+            return false;
         }
+        true
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
@@ -527,6 +535,7 @@ impl App {
             JobResult::Snapshot(Ok(shot)) => {
                 self.brightness = shot.brightness;
                 self.snapshot = Some(shot);
+                self.connection_error = None;
                 self.busy = false;
                 if self.resume_when_ready {
                     self.maybe_resume();
@@ -540,7 +549,10 @@ impl App {
             }
             JobResult::Snapshot(Err(error)) => {
                 self.busy = false;
-                self.status = format!("{error:#}");
+                self.connection_error = Some(format!("{error:#}"));
+                if self.status.starts_with("Reading the pump") {
+                    self.status = self.connection_error.clone().unwrap_or_default();
+                }
                 self.maybe_resume();
             }
             JobResult::Done(Ok(())) => {
@@ -606,20 +618,22 @@ impl eframe::App for App {
             self.show_window(ctx);
         }
         self.poll_tray(ctx);
-        if self.hide_once && self.tray.available && park_pump_window(ctx) {
-            self.hide_once = false;
-            self.in_tray = true;
-        } else if self.hide_once {
-            if self.tray.available {
-                ctx.request_repaint();
-            } else {
+        if self.hide_once && self.tray.available && window_can_hide() {
+            if park_pump_window(ctx) {
                 self.hide_once = false;
+                self.in_tray = true;
+            } else {
+                ctx.request_repaint();
             }
+        } else if self.hide_once {
+            self.hide_once = false;
         }
+        // Wayland cannot hide a window. Cancelling close there leaves the app stuck open.
         if ctx.input(|input| input.viewport().close_requested())
             && !self.quit
             && self.settings.close_to_tray
             && self.tray.available
+            && window_can_hide()
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if park_pump_window(ctx) {
@@ -649,7 +663,9 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Pump screen");
             ui.add_space(6.0);
-            if let Some(shot) = &self.snapshot {
+            if let Some(error) = &self.connection_error {
+                ui.colored_label(egui::Color32::from_rgb(255, 170, 120), error);
+            } else if let Some(shot) = &self.snapshot {
                 ui.label(format!("Serial {}", shot.serial));
                 ui.label(format!("Firmware {}", shot.firmware));
                 ui.label(format!(
@@ -742,14 +758,18 @@ impl eframe::App for App {
             ui.add_space(10.0);
             ui.separator();
             ui.label("Startup and tray");
-            if ui
-                .checkbox(
-                    &mut self.settings.close_to_tray,
-                    "Keep running in the tray when the window closes",
-                )
-                .changed()
-            {
-                self.persist();
+            if window_can_hide() {
+                if ui
+                    .checkbox(
+                        &mut self.settings.close_to_tray,
+                        "Keep running in the tray when the window closes",
+                    )
+                    .changed()
+                {
+                    self.persist();
+                }
+            } else {
+                ui.label("Closing the window quits.");
             }
             if ui
                 .checkbox(
@@ -758,31 +778,37 @@ impl eframe::App for App {
                 )
                 .changed()
             {
-                if let Err(error) = settings::set_run_at_logon(
-                    self.settings.start_with_windows,
-                    self.settings.start_in_tray,
-                ) {
+                let hidden = self.settings.start_in_tray && window_can_hide();
+                if let Err(error) =
+                    settings::set_run_at_logon(self.settings.start_with_windows, hidden)
+                {
                     self.settings.start_with_windows = !self.settings.start_with_windows;
                     self.status = format!("{error:#}");
-                } else {
-                    self.persist();
+                } else if self.persist() {
+                    self.status = if self.settings.start_with_windows {
+                        "It will start when you sign in.".into()
+                    } else {
+                        "Removed from sign-in startup.".into()
+                    };
                 }
             }
-            if ui
-                .checkbox(
-                    &mut self.settings.start_in_tray,
-                    "At sign-in, stay in the tray instead of opening this window",
-                )
-                .changed()
-            {
-                if self.settings.start_with_windows {
-                    if let Err(error) =
-                        settings::set_run_at_logon(true, self.settings.start_in_tray)
-                    {
-                        self.status = format!("{error:#}");
+            if window_can_hide() {
+                if ui
+                    .checkbox(
+                        &mut self.settings.start_in_tray,
+                        "At sign-in, stay in the tray instead of opening this window",
+                    )
+                    .changed()
+                {
+                    if self.settings.start_with_windows {
+                        if let Err(error) =
+                            settings::set_run_at_logon(true, self.settings.start_in_tray)
+                        {
+                            self.status = format!("{error:#}");
+                        }
                     }
+                    self.persist();
                 }
-                self.persist();
             }
             if ui
                 .checkbox(
@@ -794,6 +820,10 @@ impl eframe::App for App {
                 self.persist();
             }
             ui.label("Click the tray icon to show this window. Right-click it to stop the video or quit. Quitting stops playback.");
+            if ui.button("Quit").clicked() {
+                self.quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             ui.add_space(6.0);
             let can_send = self.chosen.is_some() && !self.busy;
             if ui.add_enabled(can_send, egui::Button::new("Show on pump")).clicked() {
@@ -1279,11 +1309,13 @@ impl ksni::Tray for PumpTray {
     }
 
     fn icon_name(&self) -> String {
-        "video-display".into()
+        // Ubuntu's tray uses this name instead of the pixmap, and then shows nothing
+        // when the name is not a theme icon. An empty name makes it use the pixmap.
+        String::new()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![pump_tray_pixmap()]
+        crate::icon::tray_pixmaps()
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
@@ -1342,6 +1374,19 @@ fn build_linux_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Cont
     }
 }
 
+/// Wayland has no way to hide a window. Closing must quit, or the button does nothing.
+fn window_can_hide() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return std::env::var("WINIT_UNIX_BACKEND")
+                .map(|value| value.eq_ignore_ascii_case("x11"))
+                .unwrap_or(false);
+        }
+    }
+    true
+}
+
 fn sign_in_startup_label() -> &'static str {
     #[cfg(windows)]
     {
@@ -1350,30 +1395,6 @@ fn sign_in_startup_label() -> &'static str {
     #[cfg(not(windows))]
     {
         "Start when I sign in"
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn pump_tray_pixmap() -> ksni::Icon {
-    let size = 32i32;
-    let mut data = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x - 15;
-            let dy = y - 15;
-            if dx * dx + dy * dy <= 13 * 13 {
-                let index = ((y * size + x) * 4) as usize;
-                data[index] = 255;
-                data[index + 1] = 214;
-                data[index + 2] = 64;
-                data[index + 3] = 38;
-            }
-        }
-    }
-    ksni::Icon {
-        width: size,
-        height: size,
-        data,
     }
 }
 

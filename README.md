@@ -9,7 +9,7 @@ The panel is a 720×720 screen on USB device `0B05:1DE7`. This app talks to that
 - Set brightness, rotation (0°, 90°, 180°, 270°), and wake or sleep the screen.
 - Show a photo, or play a short video, with a crop box and a zoom slider.
 - Change playback speed from 0.25× to 2× while the clip is running. 1× matches the length of the video.
-- Close the window and leave the clip running. A tray icon stays behind.
+- On Windows, close the window and leave the clip running from the tray. On Ubuntu, the close button quits.
 - Start the app when you sign in, hidden in the tray if you want, and send the last file again on its own.
 
 Click the tray icon to open the window. Right-click it to stop the video or quit. **Stop video** leaves the last frame on the pump. **Quit** exits the program.

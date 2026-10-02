@@ -137,12 +137,62 @@ fn set_run_at_logon_linux(enable: bool, hidden: bool) -> Result<()> {
         }
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "could not turn on sign-in startup, {} is not writable",
+                parent.display()
+            )
+        })?;
     }
     let exe = std::env::current_exe().context("could not find this program's path")?;
     std::fs::write(&path, autostart_desktop(&exe, hidden))
-        .with_context(|| format!("could not write {}", path.display()))
+        .with_context(|| format!("could not turn on sign-in startup at {}", path.display()))
+}
+
+/// Puts a menu entry and icon under the user's account so the dock can find them.
+#[cfg(target_os = "linux")]
+pub fn install_launcher() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(data) = data_home() else {
+        return;
+    };
+    let icon_path = data.join("icons").join("strix-lc-screen.png");
+    let desktop_path = data.join("applications").join("strix-lc-screen.desktop");
+    if let Some(parent) = icon_path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if std::fs::write(&icon_path, crate::icon::PNG).is_err() {
+        return;
+    }
+    if let Some(parent) = desktop_path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let desktop = format!(
+        "[Desktop Entry]\nType=Application\nName=Pump screen\nComment=ROG Strix LC IV pump screen\nExec={}\nIcon={}\nStartupWMClass=strix-lc-screen\nTerminal=false\nCategories=Settings;HardwareSettings;\n",
+        startup_command(&exe, false),
+        icon_path.display()
+    );
+    let _ = std::fs::write(&desktop_path, desktop);
+}
+
+#[cfg(target_os = "linux")]
+fn data_home() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg));
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".local").join("share"))
 }
 
 fn startup_command(exe: &Path, hidden: bool) -> String {
