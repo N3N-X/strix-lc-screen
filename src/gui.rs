@@ -314,32 +314,22 @@ pub fn run(start_in_tray: bool) -> eframe::Result<()> {
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
             let ctx = cc.egui_ctx.clone();
-            let click_tx = tray_tx.clone();
-            tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
-                if tray_click_shows_window(&event) {
-                    reveal_pump_window();
-                    let _ = click_tx.try_send(TrayAction::Show);
-                }
-                ctx.request_repaint();
-            }));
-            let ctx = cc.egui_ctx.clone();
-            let menu_tx = tray_tx.clone();
-            tray_icon::menu::MenuEvent::set_event_handler(Some(
-                move |event: tray_icon::menu::MenuEvent| {
-                    let _ = menu_tx.try_send(TrayAction::Menu(event.id));
-                    ctx.request_repaint();
-                },
-            ));
-            Ok(Box::new(App::new(start_in_tray, tray_rx)))
+            settings::on_show_request({
+                let ctx = ctx.clone();
+                move || ctx.request_repaint()
+            });
+            Ok(Box::new(App::new(start_in_tray, tray_tx, tray_rx, ctx)))
         }),
     )
 }
 
 enum TrayAction {
     Show,
-    Menu(tray_icon::menu::MenuId),
+    Stop,
+    Quit,
 }
 
+#[cfg(windows)]
 fn tray_click_shows_window(event: &tray_icon::TrayIconEvent) -> bool {
     match event {
         tray_icon::TrayIconEvent::Click {
@@ -384,13 +374,17 @@ struct App {
 }
 
 struct TrayMenu {
+    available: bool,
+    #[cfg(windows)]
     _icon: tray_icon::TrayIcon,
-    show_id: tray_icon::menu::MenuId,
-    stop_id: tray_icon::menu::MenuId,
-    quit_id: tray_icon::menu::MenuId,
+    #[cfg(windows)]
     _show: tray_icon::menu::MenuItem,
+    #[cfg(windows)]
     _stop: tray_icon::menu::MenuItem,
+    #[cfg(windows)]
     _quit: tray_icon::menu::MenuItem,
+    #[cfg(target_os = "linux")]
+    _handle: Option<ksni::blocking::Handle<PumpTray>>,
 }
 
 enum JobResult {
@@ -402,7 +396,12 @@ enum JobResult {
 }
 
 impl App {
-    fn new(start_in_tray: bool, tray_rx: std::sync::mpsc::Receiver<TrayAction>) -> Self {
+    fn new(
+        start_in_tray: bool,
+        tray_tx: std::sync::mpsc::SyncSender<TrayAction>,
+        tray_rx: std::sync::mpsc::Receiver<TrayAction>,
+        ctx: egui::Context,
+    ) -> Self {
         let saved = Settings::load();
         let worker = Worker::start();
         worker.set_speed(saved.speed);
@@ -447,7 +446,7 @@ impl App {
                 .checked_sub(Duration::from_secs(10))
                 .unwrap_or_else(std::time::Instant::now),
             settings: saved,
-            tray: TrayMenu::build(),
+            tray: TrayMenu::build(tray_tx, ctx),
             quit: false,
             hide_once: start_in_tray,
             in_tray: false,
@@ -480,17 +479,15 @@ impl App {
         while let Ok(action) = self.tray_rx.try_recv() {
             match action {
                 TrayAction::Show => self.show_window(ctx),
-                TrayAction::Menu(id) if id == self.tray.show_id => self.show_window(ctx),
-                TrayAction::Menu(id) if id == self.tray.stop_id => {
+                TrayAction::Stop => {
                     self.worker.stop_playback();
                     self.status = "Stopped. The pump keeps the last frame.".into();
                 }
-                TrayAction::Menu(id) if id == self.tray.quit_id => {
+                TrayAction::Quit => {
                     self.quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                TrayAction::Menu(_) => {}
             }
         }
     }
@@ -534,7 +531,11 @@ impl App {
                 if self.resume_when_ready {
                     self.maybe_resume();
                 } else if self.status.starts_with("Reading the pump") {
-                    self.status = "Ready.".into();
+                    self.status = if self.tray.available {
+                        "Ready.".into()
+                    } else {
+                        "Ready. This desktop has no tray, so closing the window quits.".into()
+                    };
                 }
             }
             JobResult::Snapshot(Err(error)) => {
@@ -601,29 +602,38 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if settings::take_show_request() {
+            self.show_window(ctx);
+        }
         self.poll_tray(ctx);
-        if self.hide_once && park_pump_window() {
+        if self.hide_once && self.tray.available && park_pump_window(ctx) {
             self.hide_once = false;
             self.in_tray = true;
         } else if self.hide_once {
-            ctx.request_repaint();
+            if self.tray.available {
+                ctx.request_repaint();
+            } else {
+                self.hide_once = false;
+            }
         }
         if ctx.input(|input| input.viewport().close_requested())
             && !self.quit
             && self.settings.close_to_tray
+            && self.tray.available
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if park_pump_window() {
+            if park_pump_window(ctx) {
                 self.in_tray = true;
             }
         }
+        // Windows puts the window back on the taskbar unless the tool style is
+        // applied again. Linux hides the window once; repeating that wakes the loop.
+        #[cfg(windows)]
         if self.in_tray {
-            // A second launch, or a tray click, puts the window back on a monitor.
             if pump_window_is_on_screen() {
                 self.in_tray = false;
             } else {
-                // The first frame's show rewrites window styles and would put a taskbar button back.
-                let _ = park_pump_window();
+                let _ = park_pump_window(ctx);
             }
         }
         self.poll(ctx);
@@ -744,7 +754,7 @@ impl eframe::App for App {
             if ui
                 .checkbox(
                     &mut self.settings.start_with_windows,
-                    "Start when I sign in to Windows",
+                    sign_in_startup_label(),
                 )
                 .changed()
             {
@@ -1172,33 +1182,198 @@ fn anyhow_worker() -> anyhow::Error {
 }
 
 impl TrayMenu {
-    fn build() -> Self {
-        use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
-        let show = MenuItem::with_id("show", "Show", true, None);
-        let stop = MenuItem::with_id("stop", "Stop video", true, None);
-        let quit = MenuItem::with_id("quit", "Quit", true, None);
-        let menu = Menu::new();
-        let _ = menu.append(&show);
-        let _ = menu.append(&stop);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&quit);
-        let icon = tray_icon_image();
-        let tray = tray_icon::TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_menu_on_left_click(false)
-            .with_tooltip("Pump screen")
-            .with_icon(icon)
-            .build()
-            .expect("the tray icon could not be created");
-        Self {
-            _icon: tray,
-            show_id: show.id().clone(),
-            stop_id: stop.id().clone(),
-            quit_id: quit.id().clone(),
-            _show: show,
-            _stop: stop,
-            _quit: quit,
+    fn build(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Context) -> Self {
+        #[cfg(windows)]
+        {
+            build_windows_tray(tx, ctx)
         }
+        #[cfg(target_os = "linux")]
+        {
+            build_linux_tray(tx, ctx)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = (tx, ctx);
+            Self { available: false }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn build_windows_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Context) -> TrayMenu {
+    use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
+    let show = MenuItem::with_id("show", "Show", true, None);
+    let stop = MenuItem::with_id("stop", "Stop video", true, None);
+    let quit = MenuItem::with_id("quit", "Quit", true, None);
+    let menu = Menu::new();
+    let _ = menu.append(&show);
+    let _ = menu.append(&stop);
+    let _ = menu.append(&PredefinedMenuItem::separator());
+    let _ = menu.append(&quit);
+    let show_id = show.id().clone();
+    let stop_id = stop.id().clone();
+    let quit_id = quit.id().clone();
+    let click_tx = tx.clone();
+    let click_ctx = ctx.clone();
+    tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+        if tray_click_shows_window(&event) {
+            reveal_pump_window();
+            let _ = click_tx.try_send(TrayAction::Show);
+        }
+        click_ctx.request_repaint();
+    }));
+    tray_icon::menu::MenuEvent::set_event_handler(Some(
+        move |event: tray_icon::menu::MenuEvent| {
+            let action = if event.id == show_id {
+                TrayAction::Show
+            } else if event.id == stop_id {
+                TrayAction::Stop
+            } else if event.id == quit_id {
+                TrayAction::Quit
+            } else {
+                return;
+            };
+            let _ = tx.try_send(action);
+            ctx.request_repaint();
+        },
+    ));
+    let icon = tray_icon_image();
+    let tray = tray_icon::TrayIconBuilder::new()
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .with_tooltip("Pump screen")
+        .with_icon(icon)
+        .build()
+        .expect("the tray icon could not be created");
+    TrayMenu {
+        available: true,
+        _icon: tray,
+        _show: show,
+        _stop: stop,
+        _quit: quit,
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PumpTray {
+    tx: std::sync::mpsc::SyncSender<TrayAction>,
+    ctx: egui::Context,
+}
+
+#[cfg(target_os = "linux")]
+impl PumpTray {
+    fn send(&mut self, action: TrayAction) {
+        let _ = self.tx.try_send(action);
+        self.ctx.request_repaint();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ksni::Tray for PumpTray {
+    fn id(&self) -> String {
+        "strix-lc-screen".into()
+    }
+
+    fn title(&self) -> String {
+        "Pump screen".into()
+    }
+
+    fn icon_name(&self) -> String {
+        "video-display".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![pump_tray_pixmap()]
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            title: "Pump screen".into(),
+            ..Default::default()
+        }
+    }
+
+    fn activate(&mut self, _x: i32, _y: i32) {
+        self.send(TrayAction::Show);
+    }
+
+    fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+        use ksni::menu::StandardItem;
+        vec![
+            StandardItem {
+                label: "Show".into(),
+                activate: Box::new(|tray: &mut Self| tray.send(TrayAction::Show)),
+                ..Default::default()
+            }
+            .into(),
+            StandardItem {
+                label: "Stop video".into(),
+                activate: Box::new(|tray: &mut Self| tray.send(TrayAction::Stop)),
+                ..Default::default()
+            }
+            .into(),
+            ksni::MenuItem::Separator,
+            StandardItem {
+                label: "Quit".into(),
+                activate: Box::new(|tray: &mut Self| tray.send(TrayAction::Quit)),
+                ..Default::default()
+            }
+            .into(),
+        ]
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_tray(tx: std::sync::mpsc::SyncSender<TrayAction>, ctx: egui::Context) -> TrayMenu {
+    use ksni::blocking::TrayMethods;
+    let tray = PumpTray { tx, ctx };
+    match tray.spawn() {
+        Ok(handle) => TrayMenu {
+            available: true,
+            _handle: Some(handle),
+        },
+        Err(error) => {
+            eprintln!("tray icon: {error}");
+            TrayMenu {
+                available: false,
+                _handle: None,
+            }
+        }
+    }
+}
+
+fn sign_in_startup_label() -> &'static str {
+    #[cfg(windows)]
+    {
+        "Start when I sign in to Windows"
+    }
+    #[cfg(not(windows))]
+    {
+        "Start when I sign in"
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pump_tray_pixmap() -> ksni::Icon {
+    let size = 32i32;
+    let mut data = vec![0u8; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x - 15;
+            let dy = y - 15;
+            if dx * dx + dy * dy <= 13 * 13 {
+                let index = ((y * size + x) * 4) as usize;
+                data[index] = 255;
+                data[index + 1] = 214;
+                data[index + 2] = 64;
+                data[index + 3] = 38;
+            }
+        }
+    }
+    ksni::Icon {
+        width: size,
+        height: size,
+        data,
     }
 }
 
@@ -1235,47 +1410,53 @@ pub fn reveal_pump_window() {
 /// `ShowWindow(SW_HIDE)` makes Windows drop `WM_PAINT`. eframe then leaves its
 /// event loop in `Poll` after a missed redraw, which burns one core and never
 /// reaches the code that starts playback.
-fn park_pump_window() -> bool {
+fn park_pump_window(ctx: &egui::Context) -> bool {
     #[cfg(windows)]
-    unsafe {
-        let Some(hwnd) = pump_hwnd() else {
-            return false;
-        };
-        if !pump_window_is_on_screen() && is_tool_window(hwnd) {
+    {
+        let _ = ctx;
+        unsafe {
+            let Some(hwnd) = pump_hwnd() else {
+                return false;
+            };
+            if !pump_window_is_on_screen() && is_tool_window(hwnd) {
+                return true;
+            }
+            set_taskbar_button(hwnd, false);
+            let rect = window_rect(hwnd);
+            let width = (rect.right - rect.left).max(1);
+            let height = (rect.bottom - rect.top).max(1);
+            let x = GetSystemMetrics(76)
+                .saturating_sub(width)
+                .saturating_sub(80);
+            let y = GetSystemMetrics(77)
+                .saturating_sub(height)
+                .saturating_sub(80);
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                x,
+                y,
+                0,
+                0,
+                0x0010 | 0x0001 | 0x0004 | 0x0020,
+            );
+            // Refresh the taskbar button, then leave the window visible so paints still arrive.
+            ShowWindow(hwnd, 0);
+            ShowWindow(hwnd, 8);
             return true;
         }
-        set_taskbar_button(hwnd, false);
-        let rect = window_rect(hwnd);
-        let width = (rect.right - rect.left).max(1);
-        let height = (rect.bottom - rect.top).max(1);
-        let x = GetSystemMetrics(76)
-            .saturating_sub(width)
-            .saturating_sub(80);
-        let y = GetSystemMetrics(77)
-            .saturating_sub(height)
-            .saturating_sub(80);
-        SetWindowPos(
-            hwnd,
-            std::ptr::null_mut(),
-            x,
-            y,
-            0,
-            0,
-            0x0010 | 0x0001 | 0x0004 | 0x0020,
-        );
-        // Refresh the taskbar button, then leave the window visible so paints still arrive.
-        ShowWindow(hwnd, 0);
-        ShowWindow(hwnd, 8);
-        return true;
     }
     #[cfg(not(windows))]
     {
-        false
+        // Hiding is safe here. The one-core spin came from Win32 dropping WM_PAINT
+        // after SW_HIDE. Playback itself runs on the worker thread.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        true
     }
 }
 
+#[cfg(windows)]
 fn pump_window_is_on_screen() -> bool {
-    #[cfg(windows)]
     unsafe {
         let Some(hwnd) = pump_hwnd() else {
             return false;
@@ -1287,11 +1468,7 @@ fn pump_window_is_on_screen() -> bool {
         let vy = GetSystemMetrics(77);
         let vw = GetSystemMetrics(78);
         let vh = GetSystemMetrics(79);
-        return cx >= vx && cy >= vy && cx < vx.saturating_add(vw) && cy < vy.saturating_add(vh);
-    }
-    #[cfg(not(windows))]
-    {
-        true
+        cx >= vx && cy >= vy && cx < vx.saturating_add(vw) && cy < vy.saturating_add(vh)
     }
 }
 
@@ -1356,6 +1533,7 @@ fn is_tool_window(hwnd: *mut std::ffi::c_void) -> bool {
     }
 }
 
+#[cfg(windows)]
 fn set_taskbar_button(hwnd: *mut std::ffi::c_void, show: bool) {
     unsafe {
         const GWL_EXSTYLE: i32 = -20;
@@ -1424,6 +1602,7 @@ mod tests {
     }
 }
 
+#[cfg(windows)]
 fn tray_icon_image() -> tray_icon::Icon {
     let size = 32u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];

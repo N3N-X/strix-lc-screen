@@ -1,9 +1,12 @@
-//! Saved options and the Windows sign-in startup entry.
+//! Saved options and the sign-in startup entry.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
+#[cfg(windows)]
 const RUN_VALUE: &str = "strix-lc-screen";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,40 +59,90 @@ impl Settings {
 }
 
 pub fn settings_path() -> PathBuf {
-    let base = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("strix-lc-screen").join("settings.json")
+    if let Some(appdata) = std::env::var_os("APPDATA") {
+        if !appdata.is_empty() {
+            return PathBuf::from(appdata)
+                .join("strix-lc-screen")
+                .join("settings.json");
+        }
+    }
+    config_dir().join("strix-lc-screen").join("settings.json")
+}
+
+fn config_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home).join(".config");
+        }
+    }
+    std::env::temp_dir()
 }
 
 pub fn set_run_at_logon(enable: bool, hidden: bool) -> Result<()> {
     #[cfg(windows)]
     {
-        use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
-        use winreg::RegKey;
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let (run, _) = hkcu
-            .create_subkey_with_flags(
-                "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                KEY_SET_VALUE,
-            )
-            .context("could not open the Windows startup list")?;
-        if enable {
-            let exe = std::env::current_exe().context("could not find this program's path")?;
-            run.set_value(RUN_VALUE, &startup_command(&exe, hidden))
-                .context("could not add this program to Windows startup")?;
-        } else if let Err(error) = run.delete_value(RUN_VALUE) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(error).context("could not remove this program from Windows startup");
-            }
-        }
-        Ok(())
+        set_run_at_logon_windows(enable, hidden)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        set_run_at_logon_linux(enable, hidden)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (enable, hidden);
-        anyhow::bail!("starting at sign-in is only available on Windows");
+        anyhow::bail!("starting at sign-in is only available on Windows and Linux");
     }
+}
+
+#[cfg(windows)]
+fn set_run_at_logon_windows(enable: bool, hidden: bool) -> Result<()> {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
+    use winreg::RegKey;
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (run, _) = hkcu
+        .create_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            KEY_SET_VALUE,
+        )
+        .context("could not open the Windows startup list")?;
+    if enable {
+        let exe = std::env::current_exe().context("could not find this program's path")?;
+        run.set_value(RUN_VALUE, &startup_command(&exe, hidden))
+            .context("could not add this program to Windows startup")?;
+    } else if let Err(error) = run.delete_value(RUN_VALUE) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error).context("could not remove this program from Windows startup");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_run_at_logon_linux(enable: bool, hidden: bool) -> Result<()> {
+    let path = config_dir()
+        .join("autostart")
+        .join("strix-lc-screen.desktop");
+    if !enable {
+        match std::fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not remove {}", path.display()));
+            }
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let exe = std::env::current_exe().context("could not find this program's path")?;
+    std::fs::write(&path, autostart_desktop(&exe, hidden))
+        .with_context(|| format!("could not write {}", path.display()))
 }
 
 fn startup_command(exe: &Path, hidden: bool) -> String {
@@ -102,13 +155,43 @@ fn startup_command(exe: &Path, hidden: bool) -> String {
     }
 }
 
+fn autostart_desktop(exe: &Path, hidden: bool) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Pump screen\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+        startup_command(exe, hidden)
+    )
+}
+
+static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+static SHOW_HOOK: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Wakes the window after a second launch asks the running copy to show itself.
+pub fn on_show_request(hook: impl Fn() + Send + Sync + 'static) {
+    let _ = SHOW_HOOK.set(Box::new(hook));
+}
+
+pub fn take_show_request() -> bool {
+    SHOW_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+fn notify_show() {
+    SHOW_REQUESTED.store(true, Ordering::SeqCst);
+    if let Some(hook) = SHOW_HOOK.get() {
+        hook();
+    }
+}
+
 /// Keeps a single window. A second launch shows the one already running.
 pub fn claim_single_instance() -> bool {
     #[cfg(windows)]
     {
         claim_single_instance_windows()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        claim_named("strix-lc-screen")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         true
     }
@@ -147,6 +230,28 @@ fn claim_single_instance_windows() -> bool {
     true
 }
 
+#[cfg(target_os = "linux")]
+fn claim_named(name: &str) -> bool {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
+    let Ok(addr) = SocketAddr::from_abstract_name(name) else {
+        return true;
+    };
+    if UnixStream::connect_addr(&addr).is_ok() {
+        return false;
+    }
+    let listener = match UnixListener::bind_addr(&addr) {
+        Ok(listener) => listener,
+        Err(_) => return UnixStream::connect_addr(&addr).is_err(),
+    };
+    std::thread::spawn(move || {
+        for _connection in listener.incoming().flatten() {
+            notify_show();
+        }
+    });
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +260,27 @@ mod tests {
     fn hidden_startup_adds_the_tray_flag() {
         let command = startup_command(Path::new(r"C:\Pump\strix-lc-screen.exe"), true);
         assert_eq!(command, r#""C:\Pump\strix-lc-screen.exe" --tray"#);
+    }
+
+    #[test]
+    fn autostart_entry_quotes_the_program_and_adds_tray() {
+        let text = autostart_desktop(Path::new("/home/nick/pump screen/strix-lc-screen"), true);
+        assert!(text.contains("Exec=\"/home/nick/pump screen/strix-lc-screen\" --tray\n"));
+        assert!(text.contains("X-GNOME-Autostart-enabled=true\n"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn second_launch_asks_the_first_to_show() {
+        let name = format!("strix-lc-screen-test-{}", std::process::id());
+        assert!(claim_named(&name));
+        assert!(!claim_named(&name));
+        let start = std::time::Instant::now();
+        while !take_show_request() {
+            if start.elapsed() > std::time::Duration::from_secs(2) {
+                panic!("the running copy was not asked to show its window");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }

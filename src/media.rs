@@ -228,7 +228,7 @@ pub fn is_video(path: &Path) -> bool {
 
 fn require_ffmpeg() -> Result<PathBuf> {
     find_ffmpeg().context(
-        "this needs ffmpeg.exe on PATH, or the copy that shipped inside the ROG app folder",
+        "this needs ffmpeg on PATH. On Windows, the copy that shipped inside the ROG app folder also works",
     )
 }
 
@@ -316,12 +316,15 @@ fn run_ffmpeg(ffmpeg: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn find_ffmpeg() -> Option<PathBuf> {
-    if let Ok(path) = which("ffmpeg") {
+    if let Some(path) = command_on_path("ffmpeg") {
         return Some(path);
     }
-    let bundled = PathBuf::from(r"C:\Program Files\rog_strix_lc_iv\bin\ffmpeg.exe");
-    if bundled.exists() {
-        return Some(bundled);
+    #[cfg(windows)]
+    {
+        let bundled = PathBuf::from(r"C:\Program Files\rog_strix_lc_iv\bin\ffmpeg.exe");
+        if bundled.is_file() {
+            return Some(bundled);
+        }
     }
     None
 }
@@ -331,21 +334,45 @@ fn hide_console(command: &mut Command) {
     {
         command.creation_flags(0x08000000);
     }
+    #[cfg(not(windows))]
+    {
+        let _ = command;
+    }
 }
 
-fn which(name: &str) -> Result<PathBuf> {
-    let mut command = Command::new("where");
-    hide_console(&mut command);
-    let output = command.arg(name).output().context("where failed")?;
-    if !output.status.success() {
-        bail!("not found");
+fn command_on_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if is_runnable(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let first = text.lines().next().unwrap_or("").trim();
-    if first.is_empty() {
-        bail!("not found");
+    None
+}
+
+fn is_runnable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
     }
-    Ok(PathBuf::from(first))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]

@@ -115,21 +115,21 @@ fn attach_console() {
 }
 
 fn ensure_official_app_is_closed() -> Result<()> {
-    let mut command = std::process::Command::new("tasklist");
-    command.args(["/FO", "CSV", "/NH"]);
     #[cfg(windows)]
     {
+        let mut command = std::process::Command::new("tasklist");
+        command.args(["/FO", "CSV", "/NH"]);
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
-    }
-    let output = command
-        .output()
-        .context("could not check whether the ASUS app is running")?;
-    let listing = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    if listing.contains("rog strix lc") {
-        bail!(
-            "Quit \"ROG STRIX LC & SLC IV Series\" first. It uses the same USB connection, so the two programs would mix up each other's replies."
-        );
+        let output = command
+            .output()
+            .context("could not check whether the ASUS app is running")?;
+        let listing = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+        if listing.contains("rog strix lc") {
+            bail!(
+                "Quit \"ROG STRIX LC & SLC IV Series\" first. It uses the same USB connection, so the two programs would mix up each other's replies."
+            );
+        }
     }
     Ok(())
 }
