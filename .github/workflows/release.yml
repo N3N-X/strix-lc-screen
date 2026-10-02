@@ -1,8 +1,9 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -31,9 +32,10 @@ jobs:
           Copy-Item $ffmpeg.FullName (Join-Path $pack "ffmpeg.exe")
           Copy-Item packaging/FFMPEG.txt $pack/
           Compress-Archive -Path $pack -DestinationPath dist/strix-lc-screen-windows-x86_64.zip
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: dist/strix-lc-screen-windows-x86_64.zip
+          name: windows
+          path: dist/strix-lc-screen-windows-x86_64.zip
 
   linux:
     runs-on: ubuntu-latest
@@ -61,9 +63,30 @@ jobs:
         run: |
           cargo install cargo-deb --version 3.6.4 --locked
           cargo deb --no-build
+          mkdir -p dist
           cp target/debian/strix-lc-screen_*.deb dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/strix-lc-screen-linux-x86_64.tar.gz
+            dist/strix-lc-screen_*.deb
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: .github/release-notes.md
+          fail_on_unmatched_files: true
+          make_latest: true
           files: |
+            dist/strix-lc-screen-windows-x86_64.zip
             dist/strix-lc-screen-linux-x86_64.tar.gz
             dist/strix-lc-screen_*.deb

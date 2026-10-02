@@ -1,48 +1,56 @@
 # strix-lc-screen
 
-This drives the pump screen on a ROG Strix LC IV / SLC IV cooler, so you can quit the official **ROG STRIX LC & SLC IV Series** app. That program stays heavy the whole time it is open.
+A small app that drives the pump screen on a ROG Strix LC IV / SLC IV cooler. It replaces the official **ROG STRIX LC & SLC IV Series** program, which stays heavy while it is open.
 
-The panel is a 720×720 screen on USB device `0B05:1DE7`. This program talks to it directly. On Windows, quit the ASUS app first. Both want the same USB connection, and the official one wins if it is still running.
+The panel is a 720×720 screen on USB device `0B05:1DE7`. This app talks to that device directly. On Windows, quit the ASUS app first. Both programs want the same USB connection, and the official one wins if it is running.
 
-You can set brightness, turn the picture (0°, 90°, 180°, 270°), and wake or sleep the screen. You can show a photo or a short video, drag a crop box, and zoom. Speed runs from 0.25× to 2× while the clip is playing. 1× is the real length of the video.
+## What you can do
 
-Close the window and the clip keeps going. A tray icon stays. Click it to open the window again. Right-click it for **Stop video** or **Quit**. Stop leaves the last frame on the pump. Quit exits, and the pump goes back to its built-in clip.
+- Set brightness, rotation (0°, 90°, 180°, 270°), and wake or sleep the screen.
+- Show a photo, or play a short video, with a crop box and a zoom slider.
+- Change playback speed from 0.25× to 2× while the clip is running. 1× matches the length of the video.
+- Close the window and leave the clip running. A tray icon stays behind.
+- Start the app when you sign in, hidden in the tray if you want, and send the last file again on its own.
 
-You can start it when you sign in, straight into the tray if you want, and send the last file again on its own.
+Click the tray icon to open the window. Right-click it to stop the video or quit. **Stop video** leaves the last frame on the pump. **Quit** exits the program.
 
-The cooler does not store your video. Pictures are JPEG frames sent from this computer, about 20 seconds long, at up to 8 frames a second. Playback lasts only while this program is running, including when the window is hidden.
+## The pump does not keep the clip
+
+Custom pictures are sent as JPEG frames from this computer. The cooler does not store your video. Playback continues while this program is running, including when the window is hidden in the tray. After you quit, the pump goes back to its built-in clip.
+
+Video is limited to about 20 seconds, sampled at up to 8 frames per second.
 
 ## Downloads
 
-Publish a release on GitHub and the build attaches three files to it:
+Builds are on the [releases page](https://github.com/N3N-X/strix-lc-screen/releases). Each download includes ffmpeg.
 
-- `strix-lc-screen-windows-x86_64.zip`, the Windows program and ffmpeg
-- `strix-lc-screen-linux-x86_64.tar.gz`, the Linux program, ffmpeg, and the udev rule
-- `strix-lc-screen_<version>_amd64.deb`, for Debian and Ubuntu, ffmpeg included
+- `strix-lc-screen-windows-x86_64.zip`. Unzip it and run `strix-lc-screen.exe`. Keep `ffmpeg.exe` in that folder.
+- `strix-lc-screen-linux-x86_64.tar.gz`. The program, ffmpeg, and a udev rule.
+- `strix-lc-screen_<version>_amd64.deb` for Debian and Ubuntu.
 
-You do not install ffmpeg yourself. Keep it in the same folder as the program. The `.deb` puts it in the right place for you. After `sudo apt install ./strix-lc-screen_*_amd64.deb`, unplug the cooler and plug it back in once, so the new USB permission applies. Then run `strix-lc-screen`.
+The package installs the program and the USB permission. After it is installed, unplug the cooler and plug it back in, then run `strix-lc-screen`.
 
-If you use the tarball instead of the package, copy the rule yourself:
+If you use the tarball, copy the rule yourself:
 
 ```bash
 sudo cp 60-strix-lc-screen.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-Unplug and plug the cooler back in after that too.
+Unplug and plug the cooler back in, then run `./strix-lc-screen` from that folder.
 
-The tray shows on KDE, on Sway, and on Ubuntu. Plain GNOME hides it until you install the AppIndicator extension. **Choose file** goes through the desktop portal, so install `xdg-desktop-portal` if that button does nothing. The ASUS program is Windows-only, so on Linux there is nothing else to close first.
+The tray icon works on KDE, Sway, and Ubuntu. Other GNOME desktops need the AppIndicator extension. **Choose file** opens the system file picker. On Linux that needs `xdg-desktop-portal`.
 
 ## Build it yourself
 
-Install [Rust](https://rustup.rs/), then:
+Install [Rust](https://rustup.rs/).
 
 ```powershell
 cargo build --release
 .\target\release\strix-lc-screen.exe
 ```
 
-On Debian or Ubuntu the compile also needs:
+On Debian or Ubuntu:
 
 ```bash
 sudo apt install build-essential pkg-config libudev-dev libxkbcommon-dev \
@@ -52,9 +60,9 @@ cargo build --release
 ./target/release/strix-lc-screen
 ```
 
-A source build does not contain ffmpeg. Install it, or put the `ffmpeg` binary in the same folder as the program. To build the `.deb` with ffmpeg inside, run `./packaging/fetch-ffmpeg.sh`, then `cargo install cargo-deb` and `cargo deb`. The package lands in `target/debian/`.
+A source build does not include ffmpeg. Install it, or put the `ffmpeg` binary in the same folder as the program. To put ffmpeg inside the `.deb`, run `./packaging/fetch-ffmpeg.sh`, then `cargo install cargo-deb` and `cargo deb`. The package is in `target/debian/`.
 
-No arguments opens the window. `--tray` opens straight into the tray, which is what sign-in startup uses.
+With no arguments, the program opens the window. Sign-in startup uses `--tray`, which opens straight into the tray.
 
 ```powershell
 .\target\release\strix-lc-screen.exe status
@@ -65,10 +73,10 @@ No arguments opens the window. `--tray` opens straight into the tray, which is w
 .\target\release\strix-lc-screen.exe show "C:\Pictures\photo.png"
 ```
 
-The same words work on Linux, with `./target/release/strix-lc-screen` in front. `power resume` wakes the screen. `power suspend` puts it to sleep. Rotation is 0, 90, 180, or 270. Brightness is 0 through 100.
+The same commands work on Linux. `power resume` wakes the screen. `power suspend` puts it to sleep. Rotation is 0, 90, 180, or 270. Brightness is 0 through 100.
 
-Settings are saved in `%APPDATA%\strix-lc-screen\settings.json` on Windows, and in `~/.config/strix-lc-screen/settings.json` on Linux. Sign-in on Windows is a registry entry. On Linux it is `~/.config/autostart/strix-lc-screen.desktop`.
+Settings are saved in `%APPDATA%\strix-lc-screen\settings.json` on Windows, and in `~/.config/strix-lc-screen/settings.json` on Linux.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). ffmpeg in the downloads is a separate program, under the LGPLv2.1. `FFMPEG.txt` in the download has the build it came from.
