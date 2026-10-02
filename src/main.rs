@@ -2,6 +2,7 @@
 
 mod frame;
 mod gui;
+mod icon;
 mod media;
 mod msg;
 mod session;
