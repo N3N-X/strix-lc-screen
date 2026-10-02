@@ -1,0 +1,8 @@
+This download includes ffmpeg, a separate program that reads the photo or video before it is sent to the pump.
+
+ffmpeg is licensed under the GNU LGPLv2.1. strix-lc-screen is MIT. They stay separate programs; this one runs ffmpeg, it is not linked into it.
+
+The build used here is ffmpeg 8.1.3 (LGPL):
+https://github.com/BtbN/FFmpeg-Builds/releases/tag/autobuild-2026-10-01-13-06
+
+Upstream source: https://ffmpeg.org/download.html

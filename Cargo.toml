@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Controller for the ROG Strix LC IV pump screen"
 license = "MIT"
+repository = "https://github.com/N3N-X/strix-lc-screen"
+readme = "README.md"
 
 [[bin]]
 name = "strix-lc-screen"
@@ -27,3 +29,25 @@ winreg = "0.55"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", features = ["blocking"] }
+
+[package.metadata.deb]
+maintainer = "N3N-X <n3n-x@users.noreply.github.com>"
+copyright = "2026 N3N-X"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Drives the pump screen on a ROG Strix LC IV cooler.
+Photos and short videos are sent as JPEG frames while this program is running.
+ffmpeg is included."""
+depends = "libc6 (>= 2.39), libudev1 (>= 183)"
+recommends = "xdg-desktop-portal"
+section = "utils"
+priority = "optional"
+revision = ""
+maintainer-scripts = "debian"
+assets = [
+    "$auto",
+    ["linux/60-strix-lc-screen.rules", "usr/lib/udev/rules.d/60-strix-lc-screen.rules", "644"],
+    ["linux/strix-lc-screen.desktop", "usr/share/applications/strix-lc-screen.desktop", "644"],
+    ["packaging/ffmpeg", "usr/lib/strix-lc-screen/ffmpeg", "755"],
+    ["packaging/FFMPEG.txt", "usr/share/doc/strix-lc-screen/ffmpeg.txt", "644"],
+]

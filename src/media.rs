@@ -228,7 +228,7 @@ pub fn is_video(path: &Path) -> bool {
 
 fn require_ffmpeg() -> Result<PathBuf> {
     find_ffmpeg().context(
-        "this needs ffmpeg on PATH. On Windows, the copy that shipped inside the ROG app folder also works",
+        "could not find ffmpeg. Release downloads include it next to this program. If you built from source, install ffmpeg or put it in the same folder",
     )
 }
 
@@ -316,17 +316,44 @@ fn run_ffmpeg(ffmpeg: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn find_ffmpeg() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        for candidate in ffmpeg_candidates(&exe) {
+            if is_runnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
     if let Some(path) = command_on_path("ffmpeg") {
         return Some(path);
     }
     #[cfg(windows)]
     {
-        let bundled = PathBuf::from(r"C:\Program Files\rog_strix_lc_iv\bin\ffmpeg.exe");
-        if bundled.is_file() {
-            return Some(bundled);
+        let asus = PathBuf::from(r"C:\Program Files\rog_strix_lc_iv\bin\ffmpeg.exe");
+        if asus.is_file() {
+            return Some(asus);
         }
     }
     None
+}
+
+fn ffmpeg_name() -> &'static str {
+    if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }
+}
+
+/// The copy shipped beside the program, then the copy the `.deb` installs under `/usr/lib`.
+fn ffmpeg_candidates(exe: &Path) -> Vec<PathBuf> {
+    let Some(dir) = exe.parent() else {
+        return Vec::new();
+    };
+    let name = ffmpeg_name();
+    vec![
+        dir.join(name),
+        dir.join("../lib/strix-lc-screen").join(name),
+    ]
 }
 
 fn hide_console(command: &mut Command) {
@@ -400,6 +427,19 @@ mod tests {
         assert_eq!(side, 360);
         assert_eq!(x, 0);
         assert_eq!(y, 360);
+    }
+
+    #[test]
+    fn bundled_ffmpeg_is_beside_the_program_or_in_the_deb() {
+        let candidates = ffmpeg_candidates(Path::new("/usr/bin/strix-lc-screen"));
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].file_name().and_then(|name| name.to_str()),
+            Some(ffmpeg_name())
+        );
+        assert!(
+            candidates[1].ends_with(Path::new("lib").join("strix-lc-screen").join(ffmpeg_name()))
+        );
     }
 
     #[test]

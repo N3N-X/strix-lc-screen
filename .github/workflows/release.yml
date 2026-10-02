@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --locked
+      - name: Zip
+        shell: pwsh
+        run: |
+          $url = (Select-String -Path packaging/sources.env -Pattern '^FFMPEG_WINDOWS_URL=(.+)$').Matches[0].Groups[1].Value
+          $src = Join-Path $env:RUNNER_TEMP "ffmpeg-src"
+          New-Item -ItemType Directory -Force $src | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile "$src/ffmpeg.zip"
+          Expand-Archive "$src/ffmpeg.zip" -DestinationPath "$src/out"
+          $ffmpeg = Get-ChildItem -Recurse "$src/out" -Filter ffmpeg.exe | Where-Object { $_.FullName -match '\\bin\\ffmpeg\.exe$' } | Select-Object -First 1
+          if (-not $ffmpeg) { throw "the ffmpeg archive had no bin/ffmpeg.exe" }
+          $pack = "dist/strix-lc-screen"
+          New-Item -ItemType Directory -Force $pack | Out-Null
+          Copy-Item target/release/strix-lc-screen.exe $pack/
+          Copy-Item $ffmpeg.FullName (Join-Path $pack "ffmpeg.exe")
+          Copy-Item packaging/FFMPEG.txt $pack/
+          Compress-Archive -Path $pack -DestinationPath dist/strix-lc-screen-windows-x86_64.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/strix-lc-screen-windows-x86_64.zip
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev libxkbcommon-dev \
+            libwayland-dev libx11-dev libxcb1-dev libxcursor-dev libxi-dev \
+            libxrandr-dev libgl1-mesa-dev dpkg-dev
+      - name: Build
+        run: cargo build --release --locked
+      - name: Bundle ffmpeg
+        run: ./packaging/fetch-ffmpeg.sh
+      - name: Tarball
+        run: |
+          mkdir -p dist/strix-lc-screen
+          cp target/release/strix-lc-screen packaging/ffmpeg packaging/FFMPEG.txt \
+            linux/60-strix-lc-screen.rules dist/strix-lc-screen/
+          chmod 755 dist/strix-lc-screen/strix-lc-screen dist/strix-lc-screen/ffmpeg
+          tar -C dist -czf dist/strix-lc-screen-linux-x86_64.tar.gz strix-lc-screen
+      - name: Debian package
+        run: |
+          cargo install cargo-deb --version 3.6.4 --locked
+          cargo deb --no-build
+          cp target/debian/strix-lc-screen_*.deb dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/strix-lc-screen-linux-x86_64.tar.gz
+            dist/strix-lc-screen_*.deb
