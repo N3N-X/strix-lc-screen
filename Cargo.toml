@@ -13,10 +13,17 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 eframe = "0.31"
-hidapi = "2"
+# Linux must use hidraw. The libusb backend does not report usage page, so the
+# pump's vendor interface (0xFF00 / 0x0001) would be invisible.
+hidapi = { version = "2", default-features = false, features = ["linux-static-hidraw"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp"] }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
 tray-icon = "0.20"
 winreg = "0.55"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }

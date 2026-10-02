@@ -1,0 +1,2 @@
+# Logged-in user can open the ROG Strix LC IV pump screen (USB 0b05:1de7).
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0b05", ATTRS{idProduct}=="1de7", TAG+="uaccess"

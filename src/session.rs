@@ -22,9 +22,7 @@ impl Panel {
     pub fn open() -> Result<Self> {
         let api = HidApi::new().context("HID library failed to start")?;
         let info = find_screen(&api)?;
-        let device = info.open_device(&api).context(
-            "could not open the pump screen. Quit \"ROG STRIX LC & SLC IV Series\" and try again",
-        )?;
+        let device = info.open_device(&api).context(open_screen_hint())?;
         device
             .set_blocking_mode(false)
             .context("could not set the screen read mode")?;
@@ -188,6 +186,17 @@ impl Panel {
             }
         }
         bail!("{cmd} got no matching reply within 2 seconds")
+    }
+}
+
+fn open_screen_hint() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "could not open the pump screen. Install linux/60-strix-lc-screen.rules, reload udev, replug the cooler, and try again"
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "could not open the pump screen. Quit \"ROG STRIX LC & SLC IV Series\" and try again"
     }
 }
 
