@@ -77,19 +77,68 @@ struct Playing {
     /// A frame has reached the pump. Later failures give up sooner than the login retry.
     delivered: bool,
     retries: u8,
+    /// One picture, sent again so the panel does not fall back to its built-in clip.
+    hold: bool,
+    paused: bool,
+}
+
+/// The panel drops a live picture about a second after the frames stop.
+const HOLD_MS: u64 = 500;
+
+fn hold_of(jpeg: Vec<u8>) -> Playing {
+    Playing {
+        frames: vec![jpeg],
+        frame_ms: HOLD_MS,
+        index: 0,
+        next_at: Instant::now() + Duration::from_millis(HOLD_MS),
+        delivered: true,
+        retries: 0,
+        hold: true,
+        paused: false,
+    }
+}
+
+/// `next_index` is the frame the loop would send next.
+fn last_sent_index(next_index: usize, len: usize, delivered: bool) -> Option<usize> {
+    if !delivered || len == 0 || next_index >= len {
+        return None;
+    }
+    Some(if next_index == 0 {
+        len - 1
+    } else {
+        next_index - 1
+    })
+}
+
+fn hold_last(play: Playing) -> Option<Playing> {
+    let index = last_sent_index(play.index, play.frames.len(), play.delivered)?;
+    let jpeg = play.frames.get(index)?.clone();
+    Some(hold_of(jpeg))
+}
+
+fn open_panel() -> Option<Panel> {
+    Panel::open()
+        .and_then(|mut panel| {
+            panel.connect()?;
+            Ok(panel)
+        })
+        .ok()
+}
+
+enum AfterCommand {
+    Pause,
+    Wake,
+    /// Brightness and rotation can kick the panel back to its built-in clip.
+    Rewake,
+    Keep,
 }
 
 fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<AtomicU32>) {
-    let mut panel = match Panel::open().and_then(|mut panel| {
-        panel.connect()?;
-        Ok(panel)
-    }) {
-        Ok(panel) => Some(panel),
-        Err(_) => None,
-    };
+    let mut panel = open_panel();
     let mut playing: Option<Playing> = None;
     loop {
         let wait = match &playing {
+            Some(play) if play.paused => Duration::from_secs(3600),
             Some(play) => play.next_at.saturating_duration_since(Instant::now()),
             None => Duration::from_secs(3600),
         };
@@ -104,7 +153,7 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
         if let Some(request) = incoming {
             match request {
                 Request::Stop => {
-                    playing = None;
+                    playing = playing.take().and_then(hold_last);
                     cancel.store(false, Ordering::Relaxed);
                 }
                 Request::Play(frames, frame_ms) => {
@@ -115,47 +164,89 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
                         next_at: Instant::now(),
                         delivered: false,
                         retries: 0,
+                        hold: false,
+                        paused: false,
                     });
                     cancel.store(false, Ordering::Relaxed);
                 }
-                other => {
-                    playing = None;
+                Request::ShowStill(jpeg, reply) => {
                     cancel.store(false, Ordering::Relaxed);
+                    playing = None;
                     if panel.is_none() {
-                        panel = Panel::open()
-                            .and_then(|mut panel| {
-                                panel.connect()?;
-                                Ok(panel)
-                            })
-                            .ok();
+                        panel = open_panel();
                     }
-                    dispatch(&mut panel, other, &cancel);
+                    let result = (|| {
+                        let panel = panel.as_mut().context("pump screen is not connected")?;
+                        panel.show_jpeg(&jpeg, &|| cancel.load(Ordering::Relaxed))
+                    })();
+                    if result.is_ok() && !cancel.load(Ordering::Relaxed) {
+                        playing = Some(hold_of(jpeg));
+                    }
+                    let _ = reply.send(result);
+                }
+                other => {
+                    let effect = match &other {
+                        Request::Power("suspend", _) => AfterCommand::Pause,
+                        Request::Power("resume", _) => AfterCommand::Wake,
+                        Request::Brightness(_, _) | Request::Rotate(_, _) => AfterCommand::Rewake,
+                        _ => AfterCommand::Keep,
+                    };
+                    if panel.is_none() {
+                        panel = open_panel();
+                    }
+                    dispatch(&mut panel, other);
+                    match effect {
+                        AfterCommand::Pause => {
+                            if let Some(play) = playing.as_mut() {
+                                play.paused = true;
+                            }
+                        }
+                        AfterCommand::Wake => {
+                            if let Some(play) = playing.as_mut() {
+                                play.paused = false;
+                                play.delivered = false;
+                                play.retries = 0;
+                                play.next_at = Instant::now();
+                            }
+                        }
+                        AfterCommand::Rewake => {
+                            if let Some(play) = playing.as_mut() {
+                                if !play.paused {
+                                    play.delivered = false;
+                                    play.retries = 0;
+                                    play.next_at = Instant::now();
+                                }
+                            }
+                        }
+                        AfterCommand::Keep => {}
+                    }
                 }
             }
         }
         if cancel.load(Ordering::Relaxed) {
-            playing = None;
+            playing = playing.take().and_then(hold_last);
+            cancel.store(false, Ordering::Relaxed);
             continue;
         }
         if playing.as_ref().is_some_and(|play| play.frames.is_empty()) {
             playing = None;
             continue;
         }
+        if playing.as_ref().is_some_and(|play| play.paused) {
+            continue;
+        }
         let ready = match playing.as_ref() {
             Some(play) if Instant::now() < play.next_at => continue,
-            Some(play) => Some((play.index == 0, play.index)),
+            // Open the picture channel once. Repeating that for every frame
+            // of a one-frame hold blanks the panel.
+            Some(play) => Some((!play.delivered, play.index)),
             None => None,
         };
         let Some((prepare, index)) = ready else {
             continue;
         };
         if panel.is_none() {
-            panel = Panel::open()
-                .and_then(|mut panel| {
-                    panel.connect()?;
-                    Ok(panel)
-                })
-                .ok();
+            panel = open_panel();
         }
         if panel.is_none() {
             if let Some(play) = playing.as_mut() {
@@ -205,7 +296,12 @@ fn worker_loop(rx: Receiver<Request>, cancel: Arc<AtomicBool>, speed: Arc<Atomic
             play.delivered = true;
             play.retries = 0;
             let thousandths = speed.load(Ordering::Relaxed).clamp(250, 2000) as f32 / 1000.0;
-            let gap = Duration::from_millis(play.frame_ms).div_f32(thousandths);
+            let gap = Duration::from_millis(play.frame_ms);
+            let gap = if play.hold {
+                gap
+            } else {
+                gap.div_f32(thousandths)
+            };
             let spent = began.elapsed();
             // If a frame already used up its slot, wait out another full slot.
             // Sending the next one immediately pegs a core trying to catch up.
@@ -226,8 +322,7 @@ fn next_frame_delay(gap: Duration, spent: Duration) -> Duration {
     }
 }
 
-fn dispatch(panel: &mut Option<Panel>, request: Request, cancel: &AtomicBool) {
-    let stopped = || cancel.load(Ordering::Relaxed);
+fn dispatch(panel: &mut Option<Panel>, request: Request) {
     match request {
         Request::Refresh(reply) => {
             let _ = reply.send(snapshot(panel));
@@ -256,12 +351,10 @@ fn dispatch(panel: &mut Option<Panel>, request: Request, cancel: &AtomicBool) {
             })();
             let _ = reply.send(result);
         }
-        Request::ShowStill(jpeg, reply) => {
-            let result = (|| {
-                let panel = panel.as_mut().context("pump screen is not connected")?;
-                panel.show_jpeg(&jpeg, &stopped)
-            })();
-            let _ = reply.send(result);
+        Request::ShowStill(_, reply) => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "the picture was not handed to the pump"
+            )));
         }
         Request::Play(_, _) | Request::Stop => {}
     }
@@ -278,7 +371,8 @@ fn snapshot(panel: &mut Option<Panel>) -> Result<Snapshot> {
 }
 
 fn read_snapshot(panel: &mut Panel) -> Result<Snapshot> {
-    let identity = panel.connect()?;
+    // `conn` is the handshake. Sending it again drops the live picture.
+    let identity = panel.identity()?;
     let state = panel.state()?;
     let brightness = state["brightness"].as_u64().unwrap_or(0).min(100) as u8;
     let rotation = state["degree"].as_u64().unwrap_or(0) as u16;
@@ -294,25 +388,33 @@ fn read_snapshot(panel: &mut Panel) -> Result<Snapshot> {
     })
 }
 
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(196, 54, 78);
+
 pub fn run(start_in_tray: bool) -> eframe::Result<()> {
     if !settings::claim_single_instance() {
         return Ok(());
     }
     let (tray_tx, tray_rx) = std::sync::mpsc::sync_channel(64);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1000.0, 640.0])
+        .with_min_inner_size([900.0, 540.0])
+        .with_resizable(true)
+        .with_decorations(true)
+        .with_title("Pump screen");
+    #[cfg(windows)]
+    {
+        viewport = viewport.with_transparent(true);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 860.0])
-            .with_min_inner_size([420.0, 560.0])
-            .with_resizable(true)
-            .with_decorations(true)
-            .with_title("Pump screen"),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
         "Pump screen",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            install_theme(&cc.egui_ctx);
+            let _ = apply_window_material();
             let ctx = cc.egui_ctx.clone();
             settings::on_show_request({
                 let ctx = ctx.clone();
@@ -371,6 +473,9 @@ struct App {
     in_tray: bool,
     resume_when_ready: bool,
     tray_rx: std::sync::mpsc::Receiver<TrayAction>,
+    material_applied: bool,
+    /// The saved window from the tall layout is resized once.
+    window_fitted: bool,
 }
 
 struct TrayMenu {
@@ -452,6 +557,8 @@ impl App {
             in_tray: false,
             resume_when_ready,
             tray_rx,
+            material_applied: false,
+            window_fitted: false,
         }
     }
 
@@ -481,7 +588,7 @@ impl App {
                 TrayAction::Show => self.show_window(ctx),
                 TrayAction::Stop => {
                     self.worker.stop_playback();
-                    self.status = "Stopped. The pump keeps the last frame.".into();
+                    self.status = "Stopped. The last frame stays until you quit.".into();
                 }
                 TrayAction::Quit => {
                     self.quit = true;
@@ -544,7 +651,7 @@ impl App {
                 self.maybe_resume();
             }
             JobResult::Done(Ok(())) => {
-                self.status = "On the pump.".into();
+                self.status = "On the pump. It stays while this app is open.".into();
                 self.pending = Some(spawn_snapshot(&self.worker));
                 self.busy = true;
             }
@@ -636,6 +743,10 @@ impl eframe::App for App {
                 let _ = park_pump_window(ctx);
             }
         }
+        if !self.material_applied {
+            self.material_applied = apply_window_material();
+        }
+        self.fit_window(ctx);
         self.poll(ctx);
         self.poll_preview(ctx);
         self.refresh_asus_flag();
@@ -645,175 +756,148 @@ impl eframe::App for App {
         } else if !self.in_tray {
             ctx.request_repaint_after(Duration::from_secs(3));
         }
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.heading("Pump screen");
-            ui.add_space(6.0);
-            if let Some(shot) = &self.snapshot {
-                ui.label(format!("Serial {}", shot.serial));
-                ui.label(format!("Firmware {}", shot.firmware));
-                ui.label(format!(
-                    "On screen: brightness {}, rotation {}°, free {}",
-                    shot.brightness, shot.rotation, shot.free_space
-                ));
-            } else {
-                ui.label("Not connected yet.");
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.label("Brightness");
-            let slider = ui.add(egui::Slider::new(&mut self.brightness, 0..=100).suffix("%"));
-            if slider.drag_stopped() && !self.busy {
-                self.apply_brightness();
-            }
-            ui.add_space(6.0);
-            ui.label("Rotation");
-            ui.horizontal(|ui| {
-                for degrees in [0u16, 90, 180, 270] {
-                    if ui.button(format!("{degrees}°")).clicked() && !self.busy {
-                        self.apply_rotation(degrees);
-                    }
-                }
+        egui::CentralPanel::default()
+            .frame(shell_frame())
+            .show(ctx, |ui| {
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.header(ui);
+                        if self.asus_running {
+                            ui.add_space(6.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 186, 110),
+                                "Quit ROG STRIX LC & SLC IV Series. It is holding the pump USB connection.",
+                            );
+                        }
+                        ui.add_space(8.0);
+                        ui.columns_const(|[left, right]| {
+                            self.picture_card(left, ctx);
+                            self.controls_card(right);
+                        });
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new(&self.status).size(13.5));
+                    });
             });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Wake").clicked() && !self.busy {
-                    self.apply_power("resume");
-                }
-                if ui.button("Sleep").clicked() && !self.busy {
-                    self.apply_power("suspend");
-                }
-                if ui.button("Refresh").clicked() && !self.busy {
-                    self.busy = true;
-                    self.status = "Reading the pump…".into();
-                    self.pending = Some(spawn_snapshot(&self.worker));
-                }
-            });
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("Photo or video");
-            if ui.button("Choose file…").clicked() && !self.busy {
-                self.choose_file(ctx);
-            }
-            if let Some(path) = &self.chosen {
-                ui.label(path.display().to_string());
-            }
-            if let Some(preview) = &self.preview {
-                ui.add_space(6.0);
-                ui.label("Drag the square to choose the part the pump shows.");
-                let crop_settled = crop_view(
-                    ui,
-                    preview,
-                    self.source_width,
-                    self.source_height,
-                    &mut self.zoom,
-                    &mut self.pan_x,
-                    &mut self.pan_y,
-                );
-                if crop_settled {
-                    self.persist();
-                }
-                ui.add_space(4.0);
-                let zoom_slider = ui.add(egui::Slider::new(&mut self.zoom, 1.0..=4.0).text("Zoom"));
-                if zoom_slider.drag_stopped() {
-                    self.persist();
-                }
-                if ui.button("Reset crop").clicked() {
-                    self.zoom = 1.0;
-                    self.pan_x = 0.0;
-                    self.pan_y = 0.0;
-                    self.persist();
-                }
-            }
-            ui.add_space(8.0);
-            ui.label("Playback speed");
-            let speed_slider = ui.add(
-                egui::Slider::new(&mut self.speed, 0.25..=2.0)
-                    .fixed_decimals(2)
-                    .suffix("×"),
-            );
-            if speed_slider.drag_stopped() {
-                self.worker.set_speed(self.speed);
-                self.persist();
-            } else if speed_slider.changed() {
-                self.worker.set_speed(self.speed);
-            }
-            ui.label("1× matches the video length. Speed changes while it plays. Crop is used the next time you press Show.");
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("Startup and tray");
-            if ui
-                .checkbox(
-                    &mut self.settings.close_to_tray,
-                    "Keep running in the tray when the window closes",
-                )
-                .changed()
-            {
-                self.persist();
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings.start_with_windows,
-                    sign_in_startup_label(),
-                )
-                .changed()
-            {
-                if let Err(error) = settings::set_run_at_logon(
-                    self.settings.start_with_windows,
-                    self.settings.start_in_tray,
-                ) {
-                    self.settings.start_with_windows = !self.settings.start_with_windows;
-                    self.status = format!("{error:#}");
-                } else {
-                    self.persist();
-                }
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings.start_in_tray,
-                    "At sign-in, stay in the tray instead of opening this window",
-                )
-                .changed()
-            {
-                if self.settings.start_with_windows {
-                    if let Err(error) =
-                        settings::set_run_at_logon(true, self.settings.start_in_tray)
-                    {
-                        self.status = format!("{error:#}");
-                    }
-                }
-                self.persist();
-            }
-            if ui
-                .checkbox(
-                    &mut self.settings.resume_last,
-                    "Play the last photo or video when the app opens",
-                )
-                .changed()
-            {
-                self.persist();
-            }
-            ui.label("Click the tray icon to show this window. Right-click it to stop the video or quit. Quitting stops playback.");
-            ui.add_space(6.0);
-            let can_send = self.chosen.is_some() && !self.busy;
-            if ui.add_enabled(can_send, egui::Button::new("Show on pump")).clicked() {
-                self.send_chosen();
-            }
-            if ui.button("Stop video").clicked() {
-                self.worker.stop_playback();
-                self.status = "Stopped. The pump keeps the last frame.".into();
-            }
-            ui.add_space(12.0);
-            ui.label(&self.status);
-            if self.asus_running {
-                ui.add_space(6.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(255, 180, 80),
-                    "Quit ROG STRIX LC & SLC IV Series. It is holding the pump USB connection.",
-                );
-            }
-            });
+    }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        #[cfg(windows)]
+        {
+            [0.0, 0.0, 0.0, 0.0]
+        }
+        #[cfg(not(windows))]
+        {
+            egui::Color32::from_rgb(16, 14, 20).to_normalized_gamma_f32()
+        }
+    }
+}
+
+fn install_theme(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals = pump_visuals();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.interact_size.y = 30.0;
+    ctx.set_style(style);
+}
+
+fn pump_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.window_fill = egui::Color32::TRANSPARENT;
+    visuals.panel_fill = egui::Color32::TRANSPARENT;
+    visuals.faint_bg_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14);
+    visuals.extreme_bg_color = egui::Color32::from_rgba_unmultiplied(18, 14, 20, 170);
+    visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::from_rgb(176, 170, 176);
+    visuals.widgets.noninteractive.bg_stroke.color =
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28);
+    let mut idle = visuals.widgets.inactive;
+    idle.bg_fill = egui::Color32::from_rgb(58, 50, 58);
+    idle.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18);
+    idle.bg_stroke = egui::Stroke::new(
+        1.0_f32,
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+    );
+    idle.corner_radius = egui::CornerRadius::same(8);
+    idle.fg_stroke.color = egui::Color32::from_rgb(240, 236, 238);
+    let mut hovered = idle;
+    hovered.weak_bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30);
+    hovered.bg_fill = egui::Color32::from_rgb(78, 66, 74);
+    let mut active = hovered;
+    active.bg_fill = ACCENT;
+    active.weak_bg_fill = ACCENT;
+    active.fg_stroke.color = egui::Color32::WHITE;
+    visuals.widgets.inactive = idle;
+    visuals.widgets.hovered = hovered;
+    visuals.widgets.active = active;
+    visuals.widgets.open = hovered;
+    visuals.selection.bg_fill = egui::Color32::from_rgb(190, 52, 74);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(230, 140, 152));
+    visuals.hyperlink_color = egui::Color32::from_rgb(255, 176, 186);
+    visuals.window_corner_radius = egui::CornerRadius::same(12);
+    visuals.menu_corner_radius = egui::CornerRadius::same(10);
+    visuals
+}
+
+fn shell_frame() -> egui::Frame {
+    #[cfg(windows)]
+    let fill = egui::Color32::from_rgba_unmultiplied(16, 12, 18, 150);
+    #[cfg(not(windows))]
+    let fill = egui::Color32::from_rgb(16, 14, 20);
+    egui::Frame::new()
+        .fill(fill)
+        .inner_margin(egui::Margin::same(16))
+}
+
+fn card_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgba_unmultiplied(34, 28, 36, 214))
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 32),
+        ))
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::same(14))
+        .outer_margin(egui::Margin::symmetric(4, 0))
+        .shadow(egui::Shadow {
+            offset: [0, 8],
+            blur: 18,
+            spread: 0,
+            color: egui::Color32::from_black_alpha(80),
+        })
+}
+
+fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    card_frame().show(ui, |ui| {
+        ui.label(egui::RichText::new(title).strong().size(15.0));
+        ui.add_space(8.0);
+        add(ui);
+    });
+}
+
+fn dim(text: &str) -> egui::RichText {
+    egui::RichText::new(text).color(egui::Color32::from_rgb(186, 180, 186))
+}
+
+fn status_pill(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.22))
+        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).color(color).size(12.0));
         });
+}
+
+fn apply_window_material() -> bool {
+    #[cfg(windows)]
+    {
+        return apply_windows_material();
+    }
+    #[cfg(not(windows))]
+    {
+        true
     }
 }
 
@@ -828,7 +912,7 @@ fn crop_view(
 ) -> bool {
     let source_width = source_width.max(1) as f32;
     let source_height = source_height.max(1) as f32;
-    let max_w = ui.available_width().min(420.0);
+    let max_w = ui.available_width().min(280.0);
     let aspect = source_width / source_height;
     let (disp_w, disp_h) = if aspect >= 1.0 {
         (max_w, max_w / aspect)
@@ -885,8 +969,8 @@ fn crop_view(
     );
     painter.rect_stroke(
         crop_rect,
-        0.0,
-        egui::Stroke::new(2.0_f32, egui::Color32::WHITE),
+        2.0,
+        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 228, 232)),
         egui::StrokeKind::Inside,
     );
     if response.dragged() {
@@ -900,6 +984,225 @@ fn crop_view(
 }
 
 impl App {
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        if self.window_fitted || self.in_tray {
+            return;
+        }
+        self.window_fitted = true;
+        let narrow = ctx.input(|input| {
+            input
+                .viewport()
+                .inner_rect
+                .map(|rect| rect.width() < 900.0)
+                .unwrap_or(true)
+        });
+        if narrow {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1000.0, 640.0)));
+        }
+    }
+
+    fn header(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 22.0), egui::Sense::hover());
+            let mark = if self.snapshot.is_some() {
+                ACCENT
+            } else {
+                egui::Color32::from_rgb(120, 116, 124)
+            };
+            ui.painter().circle_filled(rect.center(), 5.0, mark);
+            ui.heading("Pump screen");
+            ui.label(dim("ROG Strix LC IV"));
+            let (text, color) = if self.snapshot.is_some() {
+                ("Connected", egui::Color32::from_rgb(126, 196, 154))
+            } else if self.busy {
+                ("Connecting", egui::Color32::from_rgb(230, 186, 120))
+            } else {
+                ("Offline", egui::Color32::from_rgb(176, 170, 176))
+            };
+            status_pill(ui, text, color);
+            if let Some(shot) = &self.snapshot {
+                ui.label(dim(&format!(
+                    "{}   {}   {} free",
+                    shot.serial, shot.firmware, shot.free_space
+                )));
+            }
+        });
+    }
+
+    fn picture_card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        section(ui, "Picture", |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Choose file…").clicked() && !self.busy {
+                    self.choose_file(ctx);
+                }
+                if let Some(path) = &self.chosen {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("chosen file");
+                    ui.label(egui::RichText::new(name).strong())
+                        .on_hover_text(path.display().to_string());
+                }
+            });
+            if let Some(preview) = &self.preview {
+                ui.label(dim("Drag the square to crop."));
+                let crop_settled = crop_view(
+                    ui,
+                    preview,
+                    self.source_width,
+                    self.source_height,
+                    &mut self.zoom,
+                    &mut self.pan_x,
+                    &mut self.pan_y,
+                );
+                if crop_settled {
+                    self.persist();
+                }
+            }
+            ui.horizontal(|ui| {
+                let zoom_slider = ui.add(egui::Slider::new(&mut self.zoom, 1.0..=4.0).text("Zoom"));
+                if zoom_slider.drag_stopped() {
+                    self.persist();
+                }
+                if ui.button("Reset").clicked() {
+                    self.zoom = 1.0;
+                    self.pan_x = 0.0;
+                    self.pan_y = 0.0;
+                    self.persist();
+                }
+            });
+            ui.horizontal(|ui| {
+                let speed_slider = ui.add(
+                    egui::Slider::new(&mut self.speed, 0.25..=2.0)
+                        .fixed_decimals(2)
+                        .text("Speed")
+                        .suffix("×"),
+                );
+                if speed_slider.drag_stopped() {
+                    self.worker.set_speed(self.speed);
+                    self.persist();
+                } else if speed_slider.changed() {
+                    self.worker.set_speed(self.speed);
+                }
+            });
+            ui.label(dim(
+                "1× matches the video. Crop applies the next time you press Show.",
+            ));
+            ui.horizontal(|ui| {
+                let can_send = self.chosen.is_some() && !self.busy;
+                let show = egui::Button::new(
+                    egui::RichText::new("Show on pump")
+                        .strong()
+                        .color(egui::Color32::WHITE),
+                )
+                .fill(ACCENT)
+                .corner_radius(egui::CornerRadius::same(10))
+                .min_size(egui::vec2(160.0, 34.0));
+                if ui.add_enabled(can_send, show).clicked() {
+                    self.send_chosen();
+                }
+                if ui.button("Stop video").clicked() {
+                    self.worker.stop_playback();
+                    self.status = "Stopped. The last frame stays until you quit.".into();
+                }
+            });
+        });
+    }
+
+    fn controls_card(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Screen", |ui| {
+            ui.horizontal(|ui| {
+                ui.label(dim("Brightness"));
+                let slider = ui.add(egui::Slider::new(&mut self.brightness, 0..=100).suffix("%"));
+                if slider.drag_stopped() && !self.busy {
+                    self.apply_brightness();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(dim("Rotation"));
+                let current = self.snapshot.as_ref().map(|shot| shot.rotation);
+                for degrees in [0u16, 90, 180, 270] {
+                    let selected = current == Some(degrees);
+                    let mut button = egui::Button::new(format!("{degrees}°"));
+                    if selected {
+                        button = button.fill(ACCENT);
+                    }
+                    if ui.add_enabled(!self.busy, button).clicked() {
+                        self.apply_rotation(degrees);
+                    }
+                }
+                if ui.button("Wake").clicked() && !self.busy {
+                    self.apply_power("resume");
+                }
+                if ui.button("Sleep").clicked() && !self.busy {
+                    self.apply_power("suspend");
+                }
+                if ui.button("Refresh").clicked() && !self.busy {
+                    self.busy = true;
+                    self.status = "Reading the pump…".into();
+                    self.pending = Some(spawn_snapshot(&self.worker));
+                }
+            });
+        });
+        ui.add_space(8.0);
+        section(ui, "Startup and tray", |ui| {
+            if ui
+                .checkbox(
+                    &mut self.settings.close_to_tray,
+                    "Keep running in the tray when the window closes",
+                )
+                .changed()
+            {
+                self.persist();
+            }
+            if ui
+                .checkbox(
+                    &mut self.settings.start_with_windows,
+                    sign_in_startup_label(),
+                )
+                .changed()
+            {
+                if let Err(error) = settings::set_run_at_logon(
+                    self.settings.start_with_windows,
+                    self.settings.start_in_tray,
+                ) {
+                    self.settings.start_with_windows = !self.settings.start_with_windows;
+                    self.status = format!("{error:#}");
+                } else {
+                    self.persist();
+                }
+            }
+            if ui
+                .checkbox(
+                    &mut self.settings.start_in_tray,
+                    "At sign-in, stay in the tray instead of opening this window",
+                )
+                .changed()
+            {
+                if self.settings.start_with_windows {
+                    if let Err(error) =
+                        settings::set_run_at_logon(true, self.settings.start_in_tray)
+                    {
+                        self.status = format!("{error:#}");
+                    }
+                }
+                self.persist();
+            }
+            if ui
+                .checkbox(
+                    &mut self.settings.resume_last,
+                    "Play the last photo or video when the app opens",
+                )
+                .changed()
+            {
+                self.persist();
+            }
+            ui.label(dim(
+                "Click the tray icon to show this window. Right-click it to stop or quit.",
+            ));
+        });
+    }
+
     fn apply_brightness(&mut self) {
         if self.asus_running {
             self.status = "Quit the ROG STRIX LC app first.".into();
@@ -1403,6 +1706,7 @@ pub fn reveal_pump_window() {
             BringWindowToTop(hwnd);
         }
     }
+    let _ = apply_window_material();
 }
 
 /// Moves the window off the virtual screen without hiding it.
@@ -1561,6 +1865,140 @@ struct Rect {
 }
 
 #[cfg(windows)]
+#[repr(C)]
+struct DwmMargins {
+    cx_left_width: i32,
+    cx_right_width: i32,
+    cy_top_height: i32,
+    cy_bottom_height: i32,
+}
+
+#[cfg(windows)]
+fn apply_windows_material() -> bool {
+    let Some(hwnd) = pump_hwnd() else {
+        return false;
+    };
+    unsafe {
+        let dark: u32 = 1;
+        // DWMWA_USE_IMMERSIVE_DARK_MODE
+        let _ = DwmSetWindowAttribute(hwnd, 20, &dark as *const u32 as _, 4);
+        if is_windows_11() {
+            // DWMSBT_TRANSIENTWINDOW is the acrylic blur. Mica is 2, mica alt is 4.
+            let backdrop: i32 = 3;
+            let _ = DwmSetWindowAttribute(hwnd, 38, &backdrop as *const i32 as _, 4);
+            // DWMWCP_ROUND
+            let corners: i32 = 2;
+            let _ = DwmSetWindowAttribute(hwnd, 33, &corners as *const i32 as _, 4);
+            // COLORREF is 0x00BBGGRR.
+            let border: u32 = 0x00302832;
+            let caption: u32 = 0x00181016;
+            let text: u32 = 0x00F2EEF0;
+            let _ = DwmSetWindowAttribute(hwnd, 34, &border as *const u32 as _, 4);
+            let _ = DwmSetWindowAttribute(hwnd, 35, &caption as *const u32 as _, 4);
+            let _ = DwmSetWindowAttribute(hwnd, 36, &text as *const u32 as _, 4);
+            let margins = DwmMargins {
+                cx_left_width: -1,
+                cx_right_width: -1,
+                cy_top_height: -1,
+                cy_bottom_height: -1,
+            };
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        } else {
+            enable_acrylic(hwnd);
+        }
+    }
+    true
+}
+
+#[cfg(windows)]
+fn is_windows_11() -> bool {
+    #[repr(C)]
+    struct OsVersionInfoW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        csd: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+    }
+    unsafe {
+        let mut info = std::mem::zeroed::<OsVersionInfoW>();
+        info.size = std::mem::size_of::<OsVersionInfoW>() as u32;
+        if RtlGetVersion(&mut info) != 0 {
+            return false;
+        }
+        info.build >= 22000
+    }
+}
+
+#[cfg(windows)]
+fn enable_acrylic(hwnd: *mut std::ffi::c_void) {
+    #[repr(C)]
+    struct AccentPolicy {
+        state: u32,
+        flags: u32,
+        color: u32,
+        animation: u32,
+    }
+    #[repr(C)]
+    struct CompositionAttribute {
+        attribute: u32,
+        data: *mut std::ffi::c_void,
+        size: usize,
+    }
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+        fn GetProcAddress(module: *mut std::ffi::c_void, name: *const u8) -> *mut std::ffi::c_void;
+    }
+    type SetComposition =
+        unsafe extern "system" fn(*mut std::ffi::c_void, *mut CompositionAttribute) -> i32;
+    unsafe {
+        let module_name: Vec<u16> = "user32.dll"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let module = GetModuleHandleW(module_name.as_ptr());
+        if module.is_null() {
+            return;
+        }
+        let proc = GetProcAddress(module, b"SetWindowCompositionAttribute\0".as_ptr());
+        if proc.is_null() {
+            return;
+        }
+        let set: SetComposition = std::mem::transmute(proc);
+        let mut policy = AccentPolicy {
+            state: 4,
+            flags: 2,
+            color: 0xCC1A1218,
+            animation: 0,
+        };
+        let mut data = CompositionAttribute {
+            attribute: 19,
+            data: &mut policy as *mut AccentPolicy as *mut std::ffi::c_void,
+            size: std::mem::size_of::<AccentPolicy>(),
+        };
+        let _ = set(hwnd, &mut data);
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: *mut std::ffi::c_void,
+        attribute: u32,
+        data: *const std::ffi::c_void,
+        size: u32,
+    ) -> i32;
+    fn DwmExtendFrameIntoClientArea(hwnd: *mut std::ffi::c_void, margins: *const DwmMargins)
+        -> i32;
+}
+
+#[cfg(windows)]
 unsafe extern "system" {
     fn FindWindowW(class: *const u16, window: *const u16) -> *mut std::ffi::c_void;
     fn ShowWindow(hwnd: *mut std::ffi::c_void, cmd: i32) -> i32;
@@ -1589,6 +2027,15 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_that_just_played_is_the_one_before_the_cursor() {
+        assert_eq!(last_sent_index(0, 0, true), None);
+        assert_eq!(last_sent_index(0, 4, false), None);
+        assert_eq!(last_sent_index(1, 4, true), Some(0));
+        assert_eq!(last_sent_index(0, 4, true), Some(3));
+        assert_eq!(last_sent_index(0, 1, true), Some(0));
+    }
 
     #[test]
     fn a_slow_frame_still_waits_a_full_slot() {

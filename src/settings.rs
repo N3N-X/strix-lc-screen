@@ -155,6 +155,7 @@ fn startup_command(exe: &Path, hidden: bool) -> String {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn autostart_desktop(exe: &Path, hidden: bool) -> String {
     format!(
         "[Desktop Entry]\nType=Application\nName=Pump screen\nExec={}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
@@ -174,6 +175,7 @@ pub fn take_show_request() -> bool {
     SHOW_REQUESTED.swap(false, Ordering::SeqCst)
 }
 
+#[cfg(target_os = "linux")]
 fn notify_show() {
     SHOW_REQUESTED.store(true, Ordering::SeqCst);
     if let Some(hook) = SHOW_HOOK.get() {

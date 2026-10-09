@@ -4,6 +4,8 @@ A small app that drives the pump screen on a ROG Strix LC IV / SLC IV cooler. It
 
 The panel is a 720×720 screen on USB device `0B05:1DE7`. This app talks to that device directly. On Windows, quit the ASUS app first. Both programs want the same USB connection, and the official one wins if it is running.
 
+![The Pump screen window. The picture is on the left. Brightness, rotation, and startup options are on the right.](docs/pump-screen.png)
+
 ## What you can do
 
 - Set brightness, rotation (0°, 90°, 180°, 270°), and wake or sleep the screen.
@@ -16,7 +18,7 @@ Click the tray icon to open the window. Right-click it to stop the video or quit
 
 ## The pump does not keep the clip
 
-Custom pictures are sent as JPEG frames from this computer. The cooler does not store your video. Playback continues while this program is running, including when the window is hidden in the tray. After you quit, the pump goes back to its built-in clip.
+Custom pictures are sent as JPEG frames from this computer. The cooler does not store them. About a second after frames stop, the pump goes back to its built-in clip. This app keeps sending the current picture while it is running, including when the window is hidden in the tray. After you quit, the built-in clip comes back.
 
 Video is limited to about 20 seconds, sampled at up to 8 frames per second.
 

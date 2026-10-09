@@ -31,7 +31,7 @@ enum Command {
     Rotate { degrees: u16 },
     /// Wake the panel or put it to sleep. The setting is stored on the device.
     Power { event: PowerEvent },
-    /// Send one photo to the pump. The picture stays until the next one.
+    /// Send one photo to the pump. The panel drops it when this command exits.
     Show { path: std::path::PathBuf },
 }
 

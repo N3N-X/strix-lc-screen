@@ -16,6 +16,9 @@ pub struct Panel {
     seq: u32,
     /// Reused 1025-byte picture report. Filling this beats allocating one per slice.
     report: Vec<u8>,
+    /// Result of the first `conn`. A later handshake makes the panel drop the
+    /// live picture and go back to its built-in clip.
+    identity: Option<serde_json::Value>,
 }
 
 impl Panel {
@@ -30,13 +33,24 @@ impl Panel {
             device,
             seq: 0,
             report: vec![0u8; 1025],
+            identity: None,
         })
     }
 
     pub fn connect(&mut self) -> Result<serde_json::Value> {
         let response = self.call("conn", None)?;
         expect_ok(&response, "conn")?;
-        response.json().context("connect response was not JSON")
+        let identity = response.json().context("connect response was not JSON")?;
+        self.identity = Some(identity.clone());
+        Ok(identity)
+    }
+
+    /// Serial and firmware from the handshake. Does not send `conn` again.
+    pub fn identity(&mut self) -> Result<serde_json::Value> {
+        if let Some(identity) = &self.identity {
+            return Ok(identity.clone());
+        }
+        self.connect()
     }
 
     pub fn state(&mut self) -> Result<serde_json::Value> {
@@ -64,7 +78,9 @@ impl Panel {
     }
 
     /// Wake the panel, turn on the live picture channel, and push one JPEG.
-    /// The cooler shows that picture until the next one arrives.
+    /// The panel drops that picture about a second after frames stop, and goes
+    /// back to its built-in clip. Callers that want a still to remain have to
+    /// keep sending it.
     pub fn show_jpeg(&mut self, jpeg: &[u8], cancel: &dyn Fn() -> bool) -> Result<()> {
         if jpeg.is_empty() {
             bail!("picture is empty");
